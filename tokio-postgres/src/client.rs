@@ -214,6 +214,10 @@ impl Client {
         self.socket_config = Some(socket_config);
     }
 
+    pub(crate) fn get_socket_config(&self) -> Option<SocketConfig> {
+        self.socket_config.clone()
+    }
+
     /// Creates a new prepared statement.
     ///
     /// Prepared statements can be executed repeatedly, and may contain query parameters (indicated by `$1`, `$2`, etc),

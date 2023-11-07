@@ -3,12 +3,50 @@ use crate::config::{Host, LoadBalanceHosts, TargetSessionAttrs};
 use crate::connect_raw::connect_raw;
 use crate::connect_socket::connect_socket;
 use crate::tls::MakeTlsConnect;
-use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
+use crate::{Client, Config, Connection, Error, NoTls, SimpleQueryMessage, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt, Stream};
+use lazy_static::lazy_static;
+use log::info;
 use rand::seq::SliceRandom;
+use rand::Rng;
+use std::collections::HashMap;
+use std::i64::MAX;
+use std::sync::Mutex;
 use std::task::Poll;
+use std::time::Instant;
 use std::{cmp, io};
 use tokio::net;
+
+lazy_static! {
+    static ref CONNECTION_COUNT_MAP: Mutex<HashMap<Host, i64>> = {
+        let mut m = HashMap::new();
+        let host_list = HOST_INFO.lock().unwrap().clone();
+        let size = host_list.len();
+        for i in 0..size {
+            let host = host_list.get(i);
+            if !host.is_none() {
+                m.insert(host.unwrap().clone(), 0);
+            }
+        }
+        Mutex::new(m)
+    };
+    static ref LAST_TIME_META_DATA_FETCHED: Mutex<Instant> = {
+        let m = Instant::now();
+        Mutex::new(m)
+    };
+    static ref HOST_INFO: Mutex<Vec<Host>> = {
+        let m = Vec::new();
+        Mutex::new(m)
+    };
+    static ref FAILED_HOSTS: Mutex<HashMap<Host, Instant>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+    pub(crate) static ref PLACEMENT_INFO_MAP: Mutex<HashMap<String, Vec<Host>>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+}
 
 pub async fn connect<T>(
     mut tls: T,
@@ -56,7 +94,7 @@ where
             .get(i)
             .or_else(|| config.port.first())
             .copied()
-            .unwrap_or(5432);
+            .unwrap_or(5433);
 
         // The value of host is used as the hostname for TLS validation,
         let hostname = match host {
@@ -81,6 +119,383 @@ where
     }
 
     Err(error.unwrap())
+}
+
+pub async fn yb_connect<T>(
+    mut tls: T,
+    config: &Config,
+) -> Result<(Client, Connection<Socket, T::Stream>), Error>
+where
+    T: MakeTlsConnect<Socket>,
+{
+    if config.host.is_empty() && config.hostaddr.is_empty() {
+        return Err(Error::config("both host and hostaddr are missing".into()));
+    }
+
+    if !config.host.is_empty()
+        && !config.hostaddr.is_empty()
+        && config.host.len() != config.hostaddr.len()
+    {
+        let msg = format!(
+            "number of hosts ({}) is different from number of hostaddrs ({})",
+            config.host.len(),
+            config.hostaddr.len(),
+        );
+        return Err(Error::config(msg.into()));
+    }
+
+    // At this point, either one of the following two scenarios could happen:
+    // (1) either config.host or config.hostaddr must be empty;
+    // (2) if both config.host and config.hostaddr are NOT empty; their lengths must be equal.
+    let num_hosts = cmp::max(config.host.len(), config.hostaddr.len());
+
+    if config.port.len() > 1 && config.port.len() != num_hosts {
+        return Err(Error::config("invalid number of ports".into()));
+    }
+
+    if !check_and_refresh(config).await {
+        return Err(Error::connect(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "could not create control connection",
+        )));
+    }
+
+    let mut error = None;
+
+    loop {
+        let newhost = get_least_loaded_server(config);
+        let host = match newhost {
+            Some(host) => host,
+            None => {
+                if !config.topology_keys.is_empty() && config.fallback_to_topology_keys_only {
+                    return connect(tls, config).await;
+                } else {
+                    return Err(error.unwrap());
+                }
+            }
+        };
+
+        increase_connection_count(host.clone());
+
+        let hostname = match host.clone() {
+            Host::Tcp(host) => Some(host),
+            // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
+            #[cfg(unix)]
+            Host::Unix(_) => None,
+        };
+
+        info!("Creating connection to {:?}", hostname.clone());
+        match connect_host(
+            host.clone(),
+            hostname.clone(),
+            config.port[0],
+            &mut tls,
+            config,
+        )
+        .await
+        {
+            Ok((client, connection)) => return Ok((client, connection)),
+            Err(e) => error = Some(e),
+        }
+        info!("Not able to create connection to {:?}, adding it to failed host list and trying a different host.",  hostname.clone());
+        decrease_connection_count(host.clone());
+        add_to_failed_host_list(host);
+    }
+}
+
+fn increase_connection_count(host: Host) {
+    let mut conn_map = CONNECTION_COUNT_MAP.lock().unwrap();
+    let count = conn_map.get(&host);
+    if count.is_none() {
+        conn_map.insert(host.clone(), 1);
+        info!("Increasing connection count for {:?} to 1", host.clone());
+    } else {
+        let mut conn_count: i64 = *count.unwrap();
+        conn_count = conn_count + 1;
+        conn_map.insert(host.clone(), conn_count);
+        info!(
+            "Increasing connection count for {:?} by one: {}",
+            host.clone(),
+            conn_count
+        );
+    }
+}
+
+pub(crate) fn decrease_connection_count(host: Host) {
+    let mut conn_map = CONNECTION_COUNT_MAP.lock().unwrap();
+    let count = conn_map.get(&host);
+    if !count.is_none() {
+        let mut conn_count: i64 = *count.unwrap();
+        if conn_count != 0 {
+            conn_count = conn_count - 1;
+            conn_map.insert(host.clone(), conn_count);
+            info!(
+                "Decremented connection count for {:?} by one: {}",
+                host.clone(),
+                conn_count
+            );
+        }
+    }
+}
+
+fn get_least_loaded_server(config: &Config) -> Option<Host> {
+    let conn_map = CONNECTION_COUNT_MAP.lock().unwrap().clone();
+    let host_list = HOST_INFO.lock().unwrap().clone();
+    let failed_host_list = FAILED_HOSTS.lock().unwrap().clone();
+    let placement_info_map = PLACEMENT_INFO_MAP.lock().unwrap().clone();
+
+    let mut min_count = MAX;
+    let mut least_host: Vec<Host> = Vec::new();
+
+    if !config.topology_keys.is_empty() {
+        for i in 0..config.topology_keys.len() as i64 {
+            let mut server: Vec<Host> = Vec::new();
+            let prefered_zone = config.topology_keys.get(&(i + 1)).unwrap();
+            for placement_info in prefered_zone.iter() {
+                let to_check_star: Vec<&str> = placement_info.split(".").collect();
+                if to_check_star[2] == "*" {
+                    let star_placement_info: String =
+                        to_check_star[0].to_owned() + "." + &to_check_star[1];
+                    let append_hosts = placement_info_map.get(&star_placement_info);
+                    if !append_hosts.is_none() {
+                        server.extend(append_hosts.unwrap().to_owned());
+                    }
+                } else {
+                    let append_hosts = placement_info_map.get(placement_info);
+                    if !append_hosts.is_none() {
+                        server.extend(append_hosts.unwrap().to_owned());
+                    }
+                }
+            }
+            for host in server.iter() {
+                if !failed_host_list.contains_key(host) {
+                    let count = conn_map.get(host);
+                    let mut counter: i64 = 0;
+                    if !count.is_none() {
+                        counter = *count.unwrap();
+                    }
+                    if min_count > counter {
+                        min_count = counter;
+                        least_host.clear();
+                        least_host.push(host.clone());
+                    } else if min_count == counter {
+                        least_host.push(host.clone());
+                    }
+                }
+            }
+
+            if min_count != MAX && least_host.len() != 0 {
+                break;
+            }
+        }
+    }
+
+    if min_count == MAX && least_host.len() == 0 {
+        if config.topology_keys.is_empty() || !config.fallback_to_topology_keys_only {
+            for i in 0..host_list.len() {
+                let host = &host_list[i];
+                if !failed_host_list.contains_key(host) {
+                    let count = conn_map.get(host);
+                    let mut counter: i64 = 0;
+                    if !count.is_none() {
+                        counter = *count.unwrap();
+                    }
+                    if min_count > counter {
+                        min_count = counter;
+                        least_host.clear();
+                        least_host.push(host.clone());
+                    } else if min_count == counter {
+                        least_host.push(host.clone());
+                    }
+                }
+            }
+        } else {
+            return None;
+        }
+    }
+
+    if least_host.len() != 0 {
+        info!(
+            "Following hosts have the least number of connections: {:?}, chosing one randomly",
+            least_host
+        );
+        let num = rand::thread_rng().gen_range(0..least_host.len());
+        return least_host.get(num).cloned();
+    } else {
+        return None;
+    }
+}
+
+async fn check_and_refresh(config: &Config) -> bool {
+    let host_list = HOST_INFO.lock().unwrap().clone();
+    if host_list.len() == 0 {
+        info!("Connecting to the server for the first time");
+        if let Ok((client, connection)) = connect(NoTls, config).await {
+            let handle = tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("connection error: {}", e);
+                }
+            });
+            info!("Control connection created to one of {:?}", config.host);
+            refresh(client, config).await;
+            handle.abort();
+            return true;
+        } else {
+            info!("Failed to establish control connection to available servers");
+            return false;
+        }
+    } else {
+        if needs_refresh(&config) {
+            let mut index = 0;
+            while index < host_list.len() {
+                let host = host_list.get(index);
+                // The value of host is used as the hostname for TLS validation,
+                let hostname = match host {
+                    Some(Host::Tcp(host)) => Some(host.clone()),
+                    // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
+                    #[cfg(unix)]
+                    Some(Host::Unix(_)) => None,
+                    None => None,
+                };
+                if let Ok((client, connection)) = connect_host(
+                    host.unwrap().to_owned(),
+                    hostname.clone(),
+                    5433,
+                    &mut NoTls,
+                    config,
+                )
+                .await
+                {
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = connection.await {
+                            eprintln!("connection error: {}", e);
+                        }
+                    });
+                    info!("Control connection created to {:?}", hostname.clone());
+                    refresh(client, config).await;
+                    handle.abort();
+                    return true;
+                } else {
+                    info!("Failed to establish control connection to {:?}, adding this to failed host list and trying another server", hostname.clone());
+                    add_to_failed_host_list(host.cloned().unwrap());
+                    index = index + 1;
+                }
+            }
+            info!("Failed to establish control connection to available servers");
+            return false;
+        }
+    }
+    return true;
+}
+
+fn add_to_failed_host_list(host: Host) {
+    let mut failedhostlist = FAILED_HOSTS.lock().unwrap();
+    failedhostlist.insert(host.clone(), Instant::now());
+    info!("Added {:?} to failed host list", host.clone());
+}
+
+async fn refresh(client: Client, config: &Config) {
+    let start = Instant::now();
+    *LAST_TIME_META_DATA_FETCHED.lock().unwrap() = start;
+    info!("Resetting LAST_TIME_META_DATA_FETCHED");
+
+    let mut host_list = HOST_INFO.lock().unwrap();
+    let mut failed_host_list = FAILED_HOSTS.lock().unwrap();
+    let mut placement_info_map = PLACEMENT_INFO_MAP.lock().unwrap();
+    info!("Executing query: `select * from yb_servers()` to fetch list of servers");
+    for row in client
+        .query("select * from yb_servers()", &[])
+        .await
+        .unwrap()
+    {
+        let host_string: String = row.get("host");
+        let host = Host::Tcp(host_string.to_string());
+        info!("Received entry for host {:?}", host);
+        let cloud: String = row.get("cloud");
+        let region: String = row.get("region");
+        let zone: String = row.get("zone");
+        let placement_zone: String = cloud.clone() + "." + &region + "." + &zone;
+        let star_placement_zone: String = cloud.clone() + "." + &region;
+
+        if !failed_host_list.contains_key(&host) {
+            if !host_list.contains(&host) {
+                host_list.push(host.clone());
+                info!("Added {:?} to host list", host.clone());
+            }
+        } else {
+            if failed_host_list.get(&host).unwrap().elapsed()
+                > config.failed_host_reconnect_delay_secs
+            {
+                failed_host_list.remove(&host);
+                info!(
+                    "Marking {:?} as UP since failed-host-reconnect-delay-secs has elapsed",
+                    host.clone()
+                );
+                if !host_list.contains(&host) {
+                    host_list.push(host.clone());
+                }
+                make_connection_count_zero(host.clone());
+            } else if host_list.contains(&host) {
+                info!(
+                    "Keeping {:?} as DOWN since failed-host-reconnect-delay-secs has not elapsed",
+                    host.clone()
+                );
+                let index = host_list.iter().position(|x| *x == host).unwrap();
+                host_list.remove(index);
+            }
+        }
+
+        if placement_info_map.contains_key(&placement_zone) {
+            let mut present_hosts = placement_info_map.get(&placement_zone).unwrap().to_vec();
+            if !present_hosts.contains(&host) {
+                present_hosts.push(host.clone());
+                placement_info_map.insert(placement_zone, present_hosts.to_vec());
+            }
+        } else {
+            let mut host_vec: Vec<Host> = Vec::new();
+            host_vec.push(host.clone());
+            placement_info_map.insert(placement_zone, host_vec);
+        }
+
+        if placement_info_map.contains_key(&star_placement_zone) {
+            let mut star_present_hosts = placement_info_map
+                .get(&star_placement_zone)
+                .unwrap()
+                .to_vec();
+            if !star_present_hosts.contains(&host) {
+                star_present_hosts.push(host.clone());
+                placement_info_map.insert(star_placement_zone, star_present_hosts.to_vec());
+            }
+        } else {
+            let mut star_host_vec: Vec<Host> = Vec::new();
+            star_host_vec.push(host.clone());
+            placement_info_map.insert(star_placement_zone, star_host_vec);
+        }
+    }
+}
+
+fn make_connection_count_zero(host: Host) {
+    let mut conn_map = CONNECTION_COUNT_MAP.lock().unwrap();
+    let count = conn_map.get(&host);
+    if count.is_none() {
+        return;
+    }
+    conn_map.insert(host.clone(), 0);
+    info!("Resetting connection count for {:?} to zero", host.clone());
+}
+
+fn needs_refresh(config: &Config) -> bool {
+    let duration = LAST_TIME_META_DATA_FETCHED.lock().unwrap().elapsed();
+    info!("Time passed since last refresh {:?}", duration);
+    if duration > config.yb_servers_refresh_interval {
+        info!("Needs refresh as list of servers may be stale or being fetched for the first time, refreshInterval = {:?}", config.yb_servers_refresh_interval);
+        return true;
+    }
+    info!(
+        "Refresh not required, refreshInterval = {:?}",
+        config.yb_servers_refresh_interval
+    );
+    return false;
 }
 
 async fn connect_host<T>(
