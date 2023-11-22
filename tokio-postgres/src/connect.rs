@@ -11,6 +11,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashMap;
 use std::i64::MAX;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Instant;
@@ -46,7 +47,17 @@ lazy_static! {
         let m = HashMap::new();
         Mutex::new(m)
     };
+    static ref PUBLIC_HOST_MAP: Mutex<HashMap<Host, Host>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+    static ref HOST_TO_PORT_MAP: Mutex<HashMap<Host, u16>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
 }
+
+static USE_PUBLIC_IP: AtomicBool = AtomicBool::new(false);
 
 pub async fn connect<T>(
     mut tls: T,
@@ -160,22 +171,33 @@ where
         )));
     }
 
-    let mut error = None;
+    let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
 
     loop {
         let newhost = get_least_loaded_server(config);
-        let host = match newhost {
+        let mut host = match newhost {
             Some(host) => host,
             None => {
-                if !config.topology_keys.is_empty() && config.fallback_to_topology_keys_only {
-                    return connect(tls, config).await;
-                } else {
-                    return Err(error.unwrap());
-                }
+                // Fallback to original behaviour
+                return connect(tls, config).await;
             }
         };
 
         increase_connection_count(host.clone());
+
+        //check if we are to use public hosts
+        if USE_PUBLIC_IP.fetch_or(false, Ordering::SeqCst) {
+            let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
+            let public_host = public_host_map.get(&host.clone());
+            if public_host.is_none() {
+                info!("Public host not available for private host {:?}, adding this to failed host list and trying another server", host.clone());
+                decrease_connection_count(host.clone());
+                add_to_failed_host_list(host.clone());
+                continue;
+            } else {
+                host = public_host.unwrap().clone();
+            }
+        }
 
         let hostname = match host.clone() {
             Host::Tcp(host) => Some(host),
@@ -188,18 +210,19 @@ where
         match connect_host(
             host.clone(),
             hostname.clone(),
-            config.port[0],
+            host_to_port_map[&(host.clone())],
             &mut tls,
             config,
         )
         .await
         {
             Ok((client, connection)) => return Ok((client, connection)),
-            Err(e) => error = Some(e),
+            Err(_e) => {
+                info!("Not able to create connection to {:?}, adding it to failed host list and trying a different host.",  hostname.clone());
+                decrease_connection_count(host.clone());
+                add_to_failed_host_list(host);
+            }
         }
-        info!("Not able to create connection to {:?}, adding it to failed host list and trying a different host.",  hostname.clone());
-        decrease_connection_count(host.clone());
-        add_to_failed_host_list(host);
     }
 }
 
@@ -346,21 +369,37 @@ async fn check_and_refresh(config: &Config) -> bool {
         }
     } else {
         if needs_refresh(&config) {
+            let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
             let mut index = 0;
             while index < host_list.len() {
                 let host = host_list.get(index);
+                let mut conn_host = host.unwrap().to_owned();
+                //check if we are to use public hosts
+                if USE_PUBLIC_IP.fetch_or(false, Ordering::SeqCst) {
+                    let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
+                    let public_host = public_host_map.get(&conn_host.clone());
+                    if public_host.is_none() {
+                        info!("Public host not available for private host {:?}, adding this to failed host list and trying another server", conn_host.clone());
+                        add_to_failed_host_list(host.cloned().unwrap());
+                        index = index + 1;
+                        continue;
+                    } else {
+                        conn_host = public_host.unwrap().clone();
+                    }
+                }
+
                 // The value of host is used as the hostname for TLS validation,
-                let hostname = match host {
-                    Some(Host::Tcp(host)) => Some(host.clone()),
+                let hostname = match conn_host.clone() {
+                    Host::Tcp(host) => Some(host),
                     // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
                     #[cfg(unix)]
-                    Some(Host::Unix(_)) => None,
-                    None => None,
+                    Host::Unix(_) => None,
                 };
+
                 if let Ok((client, connection)) = connect_host(
-                    host.unwrap().to_owned(),
+                    conn_host.clone(),
                     hostname.clone(),
-                    5433,
+                    host_to_port_map[&(conn_host.clone())],
                     &mut NoTls,
                     config,
                 )
@@ -399,9 +438,17 @@ async fn refresh(client: Client, config: &Config) {
     *LAST_TIME_META_DATA_FETCHED.lock().unwrap() = start;
     info!("Resetting LAST_TIME_META_DATA_FETCHED");
 
+    let socket_config = client.get_socket_config();
+    let mut control_conn_host: String = String::new();
+    if socket_config.is_some() {
+        control_conn_host = socket_config.unwrap().hostname.unwrap();
+    }
+
     let mut host_list = HOST_INFO.lock().unwrap();
     let mut failed_host_list = FAILED_HOSTS.lock().unwrap();
     let mut placement_info_map = PLACEMENT_INFO_MAP.lock().unwrap();
+    let mut public_host_map = PUBLIC_HOST_MAP.lock().unwrap();
+    let mut host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap();
     info!("Executing query: `select * from yb_servers()` to fetch list of servers");
     for row in client
         .query("select * from yb_servers()", &[])
@@ -411,15 +458,27 @@ async fn refresh(client: Client, config: &Config) {
         let host_string: String = row.get("host");
         let host = Host::Tcp(host_string.to_string());
         info!("Received entry for host {:?}", host);
+        let portvalue: i64 = row.get("port");
+        let port: u16 = portvalue as u16;
         let cloud: String = row.get("cloud");
         let region: String = row.get("region");
         let zone: String = row.get("zone");
+        let public_ip_string: String = row.get("public_ip");
+        let public_ip = Host::Tcp(public_ip_string.to_string());
         let placement_zone: String = cloud.clone() + "." + &region + "." + &zone;
         let star_placement_zone: String = cloud.clone() + "." + &region;
+
+        host_to_port_map.insert(host.clone(), port);
+        host_to_port_map.insert(public_ip.clone(), port);
+
+        if control_conn_host.eq_ignore_ascii_case(&public_ip_string) {
+            USE_PUBLIC_IP.fetch_or(true, Ordering::SeqCst);
+        }
 
         if !failed_host_list.contains_key(&host) {
             if !host_list.contains(&host) {
                 host_list.push(host.clone());
+                public_host_map.insert(host.clone(), public_ip.clone());
                 info!("Added {:?} to host list", host.clone());
             }
         } else {
@@ -433,6 +492,7 @@ async fn refresh(client: Client, config: &Config) {
                 );
                 if !host_list.contains(&host) {
                     host_list.push(host.clone());
+                    public_host_map.insert(host.clone(), public_ip.clone());
                 }
                 make_connection_count_zero(host.clone());
             } else if host_list.contains(&host) {
@@ -442,6 +502,7 @@ async fn refresh(client: Client, config: &Config) {
                 );
                 let index = host_list.iter().position(|x| *x == host).unwrap();
                 host_list.remove(index);
+                public_host_map.remove(&host);
             }
         }
 
