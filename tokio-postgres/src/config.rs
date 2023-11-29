@@ -160,9 +160,7 @@ pub enum Host {
 ///     `disable`, hosts and addresses will be tried in the order provided. If set to `random`, hosts will be tried
 ///     in a random order, and the IP addresses resolved from a hostname will also be tried in a random order. Defaults
 ///     to `disable`.
-/// * `load_balance` -  It expects true/false as its possible values. In YBClusterAwareDataSource load balancing is true
-///     by default. However when using the DriverManager.getConnection() API the 'load-balance' property needs to be set
-///     to 'true'.
+/// * `load_balance` -  It expects true/false as its possible values. Default value is true.
 /// * `topology_keys` - It takes a comma separated geo-location values. A single geo-location can be given as 'cloud.region.zone'.
 ///     Multiple geo-locations too can be specified, separated by comma (,). Each placement value can be suffixed with a colon (:)
 ///     followed by a preference value between 1 and 10. A preference value of :1 means it is a primary placement. A preference
@@ -171,13 +169,13 @@ pub enum Host {
 /// * `yb_servers_refresh_interval` - Time interval, in seconds, between two attempts to refresh the information about cluster nodes.
 ///     Default is 300. Valid values are integers between 0 and 600. Value 0 means refresh for each connection request. Any value
 ///     outside this range is ignored and the default is used.
-/// * `fallback_to_topology_keys_only` - (default value: 5 seconds) The driver marks a server as failed with a timestamp, when it cannot
+/// * `fallback_to_topology_keys_only` - (default value: false) Applicable only for TopologyAware Load Balancing. When set to true,
+///     the smart driver does not attempt to connect to servers outside of primary and fallback placements specified via property.
+///     The default behaviour is to fallback to any available server in the entire cluster.
+/// * `failed_host_reconnect_delay_secs` - (default value: 5 seconds) The driver marks a server as failed with a timestamp, when it cannot
 ///     connect to it. Later, whenever it refreshes the server list via yb_servers(), if it sees the failed server in the response,
 ///     it marks the server as UP only if failed-host-reconnect-delay-secs time has elapsed. (The yb_servers() function does not remove
 ///     a failed server immediately from its result and retains it for a while.)
-/// * `failed_host_reconnect_delay_secs` - (default value: false) Applicable only for TopologyAware Load Balancing. When set to true,
-///     the smart driver does not attempt to connect to servers outside of primary and fallback placements specified via property.
-///     The default behaviour is to fallback to any available server in the entire cluster.
 ///
 /// ## Examples
 ///
@@ -667,7 +665,7 @@ impl Config {
         self.failed_host_reconnect_delay_secs
     }
 
-    ///Check is a given zone in Topology keys is valid
+    ///Check if a given zone in Topology keys is valid
     pub fn is_valid(&self, zone: &str) -> bool {
         let mut zones: Vec<&str> = zone.split(":").collect();
         if zones.len() == 0 || zones.len() > 2 {

@@ -43,7 +43,7 @@ Note that, you would still need to specify `load_balance=true` to enable the top
 
 For topology-aware load balancing, you can now specify fallback placements too. This is not applicable for cluster-aware load balancing.
 Each placement value can be suffixed with a colon (`:`) followed by a preference value between 1 and 10.
-A preference value of `:1` means it is a primary placement. A preference value of `:2` means it is the first fallback placement and so on.If no preference value is provided, it is considered to be a primary placement (equivalent to one with preference value `:1`). Example given below.
+A preference value of `:1` means it is a primary placement. A preference value of `:2` means it is the first fallback placement and so on. If no preference value is provided, it is considered to be a primary placement (equivalent to one with preference value `:1`). Example given below.
 
 ```
 "postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=true&topology_keys=cloud1.region1.zone1:1,cloud1.region1.zone2:2";
