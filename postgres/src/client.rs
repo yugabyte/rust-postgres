@@ -7,7 +7,7 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::types::{BorrowToSql, ToSql, Type};
-use tokio_postgres::{Error, Row, SimpleQueryMessage, Socket};
+use tokio_postgres::{Error, Row, SimpleQueryMessage, Socket, close};
 
 /// A synchronous PostgreSQL client.
 pub struct Client {
@@ -17,6 +17,7 @@ pub struct Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        close(&self.client);
         let _ = self.close_inner();
     }
 }

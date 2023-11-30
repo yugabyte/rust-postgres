@@ -3,6 +3,7 @@
 use crate::connection::Connection;
 use crate::Client;
 use log::info;
+use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
@@ -81,6 +82,22 @@ use tokio_postgres::{Error, Socket};
 ///     `disable`, hosts and addresses will be tried in the order provided. If set to `random`, hosts will be tried
 ///     in a random order, and the IP addresses resolved from a hostname will also be tried in a random order. Defaults
 ///     to `disable`.
+/// * `load_balance` -  It expects true/false as its possible values. Default value is true.
+/// * `topology_keys` - It takes a comma separated geo-location values. A single geo-location can be given as 'cloud.region.zone'.
+///     Multiple geo-locations too can be specified, separated by comma (,). Each placement value can be suffixed with a colon (:)
+///     followed by a preference value between 1 and 10. A preference value of :1 means it is a primary placement. A preference
+///     value of :2 means it is the first fallback placement and so on. If no preference value is provided, it is considered to
+///     be a primary placement (equivalent to one with preference value :1).
+/// * `yb_servers_refresh_interval` - Time interval, in seconds, between two attempts to refresh the information about cluster nodes.
+///     Default is 300. Valid values are integers between 0 and 600. Value 0 means refresh for each connection request. Any value
+///     outside this range is ignored and the default is used.
+/// * `fallback_to_topology_keys_only` - (default value: false) Applicable only for TopologyAware Load Balancing. When set to true,
+///     the smart driver does not attempt to connect to servers outside of primary and fallback placements specified via property.
+///     The default behaviour is to fallback to any available server in the entire cluster.
+/// * `failed_host_reconnect_delay_secs` - (default value: 5 seconds) The driver marks a server as failed with a timestamp, when it cannot
+///     connect to it. Later, whenever it refreshes the server list via yb_servers(), if it sees the failed server in the response,
+///     it marks the server as UP only if failed-host-reconnect-delay-secs time has elapsed. (The yb_servers() function does not remove
+///     a failed server immediately from its result and retains it for a while.)
 ///
 /// ## Examples
 ///
@@ -412,6 +429,103 @@ impl Config {
     /// Gets the host load balancing behavior.
     pub fn get_load_balance_hosts(&self) -> LoadBalanceHosts {
         self.config.get_load_balance_hosts()
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the load balance parameter.
+    ///
+    /// Defaults to false.
+    pub fn load_balance(&mut self, load_balance: bool) -> &mut Config {
+        self.config.load_balance(load_balance);
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the load balance value
+    pub fn get_load_balance(&self) -> bool {
+        self.config.get_load_balance()
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the topology key parameter.
+    ///
+    /// Defaults to Hashmap::new().
+    pub fn topology_keys(&mut self, topology_key: &str, priority: i64) -> &mut Config {
+        self.config.topology_keys(topology_key, priority);
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the host topology keys value.
+    pub fn get_topology_keys(&self) -> HashMap<i64, Vec<String>> {
+        self.config.get_topology_keys()
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the yb_servers_refresh_interval parameter.
+    ///
+    /// Defaults to 300 sec.
+    pub fn yb_servers_refresh_interval(
+        &mut self,
+        yb_servers_refresh_interval: Duration,
+    ) -> &mut Config {
+        self.config
+            .yb_servers_refresh_interval(yb_servers_refresh_interval);
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the yb_servers_refresh_interval value.
+    pub fn get_yb_servers_refresh_interval(&self) -> Duration {
+        self.config.get_yb_servers_refresh_interval()
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the fallback_to_topology_keys_only parameter.
+    ///
+    /// Defaults to false.
+    pub fn fallback_to_topology_keys_only(
+        &mut self,
+        fallback_to_topology_keys_only: bool,
+    ) -> &mut Config {
+        self.config
+            .fallback_to_topology_keys_only(fallback_to_topology_keys_only);
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the fallback_to_topology_keys_only value.
+    pub fn get_fallback_to_topology_keys_only(&self) -> bool {
+        self.config.get_fallback_to_topology_keys_only()
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the failed_host_reconnect_delay_secs parameter.
+    ///
+    /// Defaults to 5 sec.
+    pub fn failed_host_reconnect_delay_secs(
+        &mut self,
+        failed_host_reconnect_delay_secs: Duration,
+    ) -> &mut Config {
+        self.config
+            .failed_host_reconnect_delay_secs(failed_host_reconnect_delay_secs);
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the failed_host_reconnect_delay_secs value.
+    pub fn get_failed_host_reconnect_delay_secs(&self) -> Duration {
+        self.config.get_failed_host_reconnect_delay_secs()
     }
 
     /// Sets the notice callback.

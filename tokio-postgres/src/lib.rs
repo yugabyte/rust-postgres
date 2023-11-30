@@ -118,6 +118,10 @@
 //! | `with-time-0_3` | Enable support for the 0.3 version of the `time` crate. | [time](https://crates.io/crates/time/0.3.0) 0.3 | no |
 #![warn(rust_2018_idioms, clippy::all, missing_docs)]
 
+use config::Host;
+use connect::decrease_connection_count;
+use log::info;
+
 pub use crate::cancel_token::CancelToken;
 pub use crate::client::Client;
 pub use crate::config::Config;
@@ -196,6 +200,16 @@ where
 {
     let config = config.parse::<Config>()?;
     config.connect(tls).await
+}
+
+///close connection to server
+pub fn close(client: &Client) {
+    let socket_config = client.get_socket_config();
+    if !socket_config.is_none() {
+        let host = socket_config.unwrap().hostname;
+        info!("closing one connection to {:?}", host);
+        decrease_connection_count(Host::Tcp(host.unwrap()));
+    }
 }
 
 /// An asynchronous notification.

@@ -2,6 +2,7 @@
 
 #[cfg(feature = "runtime")]
 use crate::connect::connect;
+use crate::connect::{yb_connect, PLACEMENT_INFO_MAP};
 use crate::connect_raw::connect_raw;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::keepalive::KeepaliveConfig;
@@ -11,7 +12,9 @@ use crate::tls::TlsConnect;
 #[cfg(feature = "runtime")]
 use crate::Socket;
 use crate::{Client, Connection, Error};
+use env_logger::{Builder, Target};
 use std::borrow::Cow;
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::OsStr;
 use std::net::IpAddr;
@@ -22,9 +25,21 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str;
 use std::str::FromStr;
+use std::sync::Once;
 use std::time::Duration;
 use std::{error, fmt, iter, mem};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+static INIT: Once = Once::new();
+
+fn logger_setup() {
+    let mut builder = Builder::from_default_env();
+    builder.target(Target::Stdout);
+
+    INIT.call_once(|| {
+        builder.init();
+    });
+}
 
 /// Properties required of a session.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -71,7 +86,7 @@ pub enum LoadBalanceHosts {
 }
 
 /// A host specification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Host {
     /// A TCP hostname.
     Tcp(String),
@@ -145,6 +160,22 @@ pub enum Host {
 ///     `disable`, hosts and addresses will be tried in the order provided. If set to `random`, hosts will be tried
 ///     in a random order, and the IP addresses resolved from a hostname will also be tried in a random order. Defaults
 ///     to `disable`.
+/// * `load_balance` -  It expects true/false as its possible values. Default value is true.
+/// * `topology_keys` - It takes a comma separated geo-location values. A single geo-location can be given as 'cloud.region.zone'.
+///     Multiple geo-locations too can be specified, separated by comma (,). Each placement value can be suffixed with a colon (:)
+///     followed by a preference value between 1 and 10. A preference value of :1 means it is a primary placement. A preference
+///     value of :2 means it is the first fallback placement and so on. If no preference value is provided, it is considered to
+///     be a primary placement (equivalent to one with preference value :1).
+/// * `yb_servers_refresh_interval` - Time interval, in seconds, between two attempts to refresh the information about cluster nodes.
+///     Default is 300. Valid values are integers between 0 and 600. Value 0 means refresh for each connection request. Any value
+///     outside this range is ignored and the default is used.
+/// * `fallback_to_topology_keys_only` - (default value: false) Applicable only for TopologyAware Load Balancing. When set to true,
+///     the smart driver does not attempt to connect to servers outside of primary and fallback placements specified via property.
+///     The default behaviour is to fallback to any available server in the entire cluster.
+/// * `failed_host_reconnect_delay_secs` - (default value: 5 seconds) The driver marks a server as failed with a timestamp, when it cannot
+///     connect to it. Later, whenever it refreshes the server list via yb_servers(), if it sees the failed server in the response,
+///     it marks the server as UP only if failed-host-reconnect-delay-secs time has elapsed. (The yb_servers() function does not remove
+///     a failed server immediately from its result and retains it for a while.)
 ///
 /// ## Examples
 ///
@@ -207,6 +238,12 @@ pub struct Config {
     pub(crate) target_session_attrs: TargetSessionAttrs,
     pub(crate) channel_binding: ChannelBinding,
     pub(crate) load_balance_hosts: LoadBalanceHosts,
+    /// YugabyteDB Specific
+    pub(crate) load_balance: bool,
+    pub(crate) topology_keys: HashMap<i64, Vec<String>>,
+    pub(crate) yb_servers_refresh_interval: Duration,
+    pub(crate) fallback_to_topology_keys_only: bool,
+    pub(crate) failed_host_reconnect_delay_secs: Duration,
 }
 
 impl Default for Config {
@@ -240,6 +277,11 @@ impl Config {
             target_session_attrs: TargetSessionAttrs::Any,
             channel_binding: ChannelBinding::Prefer,
             load_balance_hosts: LoadBalanceHosts::Disable,
+            load_balance: false,
+            topology_keys: HashMap::new(),
+            yb_servers_refresh_interval: Duration::new(300, 0),
+            fallback_to_topology_keys_only: false,
+            failed_host_reconnect_delay_secs: Duration::new(5, 0),
         }
     }
 
@@ -520,6 +562,141 @@ impl Config {
         self.load_balance_hosts
     }
 
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the load balance parameter.
+    ///
+    /// Defaults to false.
+    pub fn load_balance(&mut self, load_balance: bool) -> &mut Config {
+        self.load_balance = load_balance;
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the load balance value
+    pub fn get_load_balance(&self) -> bool {
+        self.load_balance
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the topology key parameter.
+    ///
+    /// Defaults to Hashmap::new().
+    pub fn topology_keys(&mut self, topology_key: &str, priority: i64) -> &mut Config {
+        let current_zones: Option<&Vec<String>> = self.topology_keys.get(&priority);
+        if current_zones.is_none() {
+            let mut topology_vec: Vec<String> = Vec::new();
+            topology_vec.push(topology_key.to_owned());
+            self.topology_keys.insert(priority, topology_vec);
+        } else {
+            let mut current_zones_vec: Vec<String> = current_zones.unwrap().to_vec();
+            current_zones_vec.push(topology_key.to_owned());
+            self.topology_keys.insert(priority, current_zones_vec);
+        }
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the host topology keys value.
+    pub fn get_topology_keys(&self) -> HashMap<i64, Vec<String>> {
+        self.topology_keys.clone()
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the yb_servers_refresh_interval parameter.
+    ///
+    /// Defaults to 300 sec.
+    pub fn yb_servers_refresh_interval(
+        &mut self,
+        yb_servers_refresh_interval: Duration,
+    ) -> &mut Config {
+        self.yb_servers_refresh_interval = yb_servers_refresh_interval;
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the yb_servers_refresh_interval value.
+    pub fn get_yb_servers_refresh_interval(&self) -> Duration {
+        self.yb_servers_refresh_interval
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the fallback_to_topology_keys_only parameter.
+    ///
+    /// Defaults to false.
+    pub fn fallback_to_topology_keys_only(
+        &mut self,
+        fallback_to_topology_keys_only: bool,
+    ) -> &mut Config {
+        self.fallback_to_topology_keys_only = fallback_to_topology_keys_only;
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the fallback_to_topology_keys_only value.
+    pub fn get_fallback_to_topology_keys_only(&self) -> bool {
+        self.fallback_to_topology_keys_only
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Sets the failed_host_reconnect_delay_secs parameter.
+    ///
+    /// Defaults to 5 sec.
+    pub fn failed_host_reconnect_delay_secs(
+        &mut self,
+        failed_host_reconnect_delay_secs: Duration,
+    ) -> &mut Config {
+        self.failed_host_reconnect_delay_secs = failed_host_reconnect_delay_secs;
+        self
+    }
+
+    /// YugabyteDB Specific.
+    ///
+    /// Gets the failed_host_reconnect_delay_secs value.
+    pub fn get_failed_host_reconnect_delay_secs(&self) -> Duration {
+        self.failed_host_reconnect_delay_secs
+    }
+
+    ///Check if a given zone in Topology keys is valid
+    pub fn is_valid(&self, zone: &str) -> bool {
+        let mut zones: Vec<&str> = zone.split(":").collect();
+        if zones.len() == 0 || zones.len() > 2 {
+            return false;
+        }
+        let placement: Vec<&str> = zones[0].split(".").collect();
+        if placement.len() != 3 {
+            return false;
+        }
+        if zones.len() == 1 {
+            zones.push("1");
+        }
+        let priority = zones[1].parse::<i64>();
+        if priority.is_err() {
+            return false;
+        } else {
+            let priorityvalue = priority.unwrap();
+            if priorityvalue < 1 || priorityvalue > 10 {
+                return false;
+            }
+        }
+        let placementinfo = PLACEMENT_INFO_MAP.lock().unwrap().clone();
+        if placement[2] != "*" {
+            placementinfo.contains_key(zones[0]);
+        } else {
+            let starplacement: String = placement[0].to_owned() + placement[1];
+            placementinfo.contains_key(&starplacement);
+        }
+        true
+    }
+
     fn param(&mut self, key: &str, value: &str) -> Result<(), Error> {
         match key {
             "user" => {
@@ -562,7 +739,7 @@ impl Config {
             "port" => {
                 for port in value.split(',') {
                     let port = if port.is_empty() {
-                        5432
+                        5433
                     } else {
                         port.parse()
                             .map_err(|_| Error::config_parse(Box::new(InvalidValue("port"))))?
@@ -655,6 +832,50 @@ impl Config {
                 };
                 self.load_balance_hosts(load_balance_hosts);
             }
+            "load_balance" => {
+                let load_balance = value
+                    .parse::<bool>()
+                    .map_err(|_| Error::config_parse(Box::new(InvalidValue("load_balance"))))?;
+                self.load_balance(load_balance);
+            }
+            "topology_keys" => {
+                for topology_keys in value.split(',') {
+                    if self.is_valid(topology_keys) {
+                        let mut zones: Vec<&str> = topology_keys.split(":").collect();
+                        if zones.len() == 1 {
+                            zones.push("1");
+                        }
+                        let priority = zones[1].parse::<i64>().unwrap();
+                        self.topology_keys(zones[0], priority);
+                    } else {
+                        return Err(Error::config_parse(Box::new(InvalidValue("topology_keys"))));
+                    }
+                }
+            }
+            "yb_servers_refresh_interval" => {
+                let refresh_interval = value.parse::<i64>().map_err(|_| {
+                    Error::config_parse(Box::new(InvalidValue("yb_servers_refresh_interval")))
+                })?;
+                if refresh_interval >= 0 && refresh_interval <= 600 {
+                    self.yb_servers_refresh_interval(Duration::from_secs(refresh_interval as u64));
+                }
+            }
+            "fallback_to_topology_keys_only" => {
+                let fallback_to_topology_keys_only = value.parse::<bool>().map_err(|_| {
+                    Error::config_parse(Box::new(InvalidValue("fallback_to_topology_keys_only")))
+                })?;
+                self.fallback_to_topology_keys_only(fallback_to_topology_keys_only);
+            }
+            "failed_host_reconnect_delay_secs" => {
+                let failed_host_reconnect_delay_secs = value.parse::<i64>().map_err(|_| {
+                    Error::config_parse(Box::new(InvalidValue("failed_host_reconnect_delay_secs")))
+                })?;
+                if failed_host_reconnect_delay_secs >= 0 && failed_host_reconnect_delay_secs <= 60 {
+                    self.failed_host_reconnect_delay_secs(Duration::from_secs(
+                        failed_host_reconnect_delay_secs as u64,
+                    ));
+                }
+            }
             key => {
                 return Err(Error::config_parse(Box::new(UnknownOption(
                     key.to_string(),
@@ -673,7 +894,12 @@ impl Config {
     where
         T: MakeTlsConnect<Socket>,
     {
-        connect(tls, self).await
+        if self.load_balance == true {
+            logger_setup();
+            yb_connect(tls, self).await
+        } else {
+            connect(tls, self).await
+        }
     }
 
     /// Connects to a PostgreSQL database over an arbitrary stream.
@@ -1031,7 +1257,7 @@ impl<'a> UrlParser<'a> {
             };
 
             self.host_param(host)?;
-            let port = self.decode(port.unwrap_or("5432"))?;
+            let port = self.decode(port.unwrap_or("5433"))?;
             self.config.param("port", &port)?;
         }
 
