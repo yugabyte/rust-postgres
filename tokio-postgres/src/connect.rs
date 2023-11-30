@@ -6,7 +6,7 @@ use crate::tls::MakeTlsConnect;
 use crate::{Client, Config, Connection, Error, NoTls, SimpleQueryMessage, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt, Stream};
 use lazy_static::lazy_static;
-use log::info;
+use log::{debug, info};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashMap;
@@ -186,7 +186,7 @@ where
         increase_connection_count(host.clone());
 
         //check if we are to use public hosts
-        if USE_PUBLIC_IP.fetch_or(false, Ordering::SeqCst) {
+        if USE_PUBLIC_IP.load(Ordering::SeqCst) {
             let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
             let public_host = public_host_map.get(&host.clone());
             if public_host.is_none() {
@@ -231,12 +231,12 @@ fn increase_connection_count(host: Host) {
     let count = conn_map.get(&host);
     if count.is_none() {
         conn_map.insert(host.clone(), 1);
-        info!("Increasing connection count for {:?} to 1", host.clone());
+        debug!("Increasing connection count for {:?} to 1", host.clone());
     } else {
         let mut conn_count: i64 = *count.unwrap();
         conn_count = conn_count + 1;
         conn_map.insert(host.clone(), conn_count);
-        info!(
+        debug!(
             "Increasing connection count for {:?} by one: {}",
             host.clone(),
             conn_count
@@ -252,7 +252,7 @@ pub(crate) fn decrease_connection_count(host: Host) {
         if conn_count != 0 {
             conn_count = conn_count - 1;
             conn_map.insert(host.clone(), conn_count);
-            info!(
+            debug!(
                 "Decremented connection count for {:?} by one: {}",
                 host.clone(),
                 conn_count
@@ -350,6 +350,7 @@ fn get_least_loaded_server(config: &Config) -> Option<Host> {
 }
 
 async fn check_and_refresh(config: &Config) -> bool {
+    let mut refresh_time = LAST_TIME_META_DATA_FETCHED.lock().unwrap();
     let host_list = HOST_INFO.lock().unwrap().clone();
     if host_list.len() == 0 {
         info!("Connecting to the server for the first time");
@@ -361,6 +362,9 @@ async fn check_and_refresh(config: &Config) -> bool {
             });
             info!("Control connection created to one of {:?}", config.host);
             refresh(client, config).await;
+            let start = Instant::now();
+            *refresh_time = start;
+            info!("Resetting LAST_TIME_META_DATA_FETCHED");
             handle.abort();
             return true;
         } else {
@@ -368,14 +372,15 @@ async fn check_and_refresh(config: &Config) -> bool {
             return false;
         }
     } else {
-        if needs_refresh(&config) {
+        let duration = refresh_time.elapsed();
+        if duration > config.yb_servers_refresh_interval {
             let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
             let mut index = 0;
             while index < host_list.len() {
                 let host = host_list.get(index);
                 let mut conn_host = host.unwrap().to_owned();
                 //check if we are to use public hosts
-                if USE_PUBLIC_IP.fetch_or(false, Ordering::SeqCst) {
+                if USE_PUBLIC_IP.load(Ordering::SeqCst) {
                     let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
                     let public_host = public_host_map.get(&conn_host.clone());
                     if public_host.is_none() {
@@ -412,6 +417,9 @@ async fn check_and_refresh(config: &Config) -> bool {
                     });
                     info!("Control connection created to {:?}", hostname.clone());
                     refresh(client, config).await;
+                    let start = Instant::now();
+                    *refresh_time = start;
+                    info!("Resetting LAST_TIME_META_DATA_FETCHED");
                     handle.abort();
                     return true;
                 } else {
@@ -434,10 +442,6 @@ fn add_to_failed_host_list(host: Host) {
 }
 
 async fn refresh(client: Client, config: &Config) {
-    let start = Instant::now();
-    *LAST_TIME_META_DATA_FETCHED.lock().unwrap() = start;
-    info!("Resetting LAST_TIME_META_DATA_FETCHED");
-
     let socket_config = client.get_socket_config();
     let mut control_conn_host: String = String::new();
     if socket_config.is_some() {
@@ -472,21 +476,21 @@ async fn refresh(client: Client, config: &Config) {
         host_to_port_map.insert(public_ip.clone(), port);
 
         if control_conn_host.eq_ignore_ascii_case(&public_ip_string) {
-            USE_PUBLIC_IP.fetch_or(true, Ordering::SeqCst);
+            USE_PUBLIC_IP.store(true, Ordering::SeqCst);
         }
 
         if !failed_host_list.contains_key(&host) {
             if !host_list.contains(&host) {
                 host_list.push(host.clone());
                 public_host_map.insert(host.clone(), public_ip.clone());
-                info!("Added {:?} to host list", host.clone());
+                debug!("Added {:?} to host list", host.clone());
             }
         } else {
             if failed_host_list.get(&host).unwrap().elapsed()
                 > config.failed_host_reconnect_delay_secs
             {
                 failed_host_list.remove(&host);
-                info!(
+                debug!(
                     "Marking {:?} as UP since failed-host-reconnect-delay-secs has elapsed",
                     host.clone()
                 );
@@ -496,8 +500,8 @@ async fn refresh(client: Client, config: &Config) {
                 }
                 make_connection_count_zero(host.clone());
             } else if host_list.contains(&host) {
-                info!(
-                    "Keeping {:?} as DOWN since failed-host-reconnect-delay-secs has not elapsed",
+                debug!(
+                    "Treating {:?} as DOWN since failed-host-reconnect-delay-secs has not elapsed",
                     host.clone()
                 );
                 let index = host_list.iter().position(|x| *x == host).unwrap();
@@ -542,22 +546,9 @@ fn make_connection_count_zero(host: Host) {
         return;
     }
     conn_map.insert(host.clone(), 0);
-    info!("Resetting connection count for {:?} to zero", host.clone());
+    debug!("Resetting connection count for {:?} to zero", host.clone());
 }
 
-fn needs_refresh(config: &Config) -> bool {
-    let duration = LAST_TIME_META_DATA_FETCHED.lock().unwrap().elapsed();
-    info!("Time passed since last refresh {:?}", duration);
-    if duration > config.yb_servers_refresh_interval {
-        info!("Needs refresh as list of servers may be stale or being fetched for the first time, refreshInterval = {:?}", config.yb_servers_refresh_interval);
-        return true;
-    }
-    info!(
-        "Refresh not required, refreshInterval = {:?}",
-        config.yb_servers_refresh_interval
-    );
-    return false;
-}
 
 async fn connect_host<T>(
     host: Host,
