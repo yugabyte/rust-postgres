@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use postgres::{Client, NoTls};
+use yb_postgres::{Client, NoTls};
 
 // spawned: 249us 252us 255us
 // local: 214us 216us 219us

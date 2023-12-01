@@ -12,10 +12,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time;
-use tokio_postgres::error::SqlState;
-use tokio_postgres::tls::{NoTls, NoTlsStream};
-use tokio_postgres::types::{Kind, Type};
-use tokio_postgres::{
+use yb_tokio_postgres::error::SqlState;
+use yb_tokio_postgres::tls::{NoTls, NoTlsStream};
+use yb_tokio_postgres::types::{Kind, Type};
+use yb_tokio_postgres::{
     AsyncMessage, Client, Config, Connection, Error, IsolationLevel, SimpleQueryMessage,
 };
 

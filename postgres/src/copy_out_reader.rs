@@ -3,7 +3,7 @@ use crate::lazy_pin::LazyPin;
 use bytes::{Buf, Bytes};
 use futures_util::StreamExt;
 use std::io::{self, BufRead, Read};
-use tokio_postgres::CopyOutStream;
+use yb_tokio_postgres::CopyOutStream;
 
 /// The reader returned by the `copy_out` method.
 pub struct CopyOutReader<'a> {

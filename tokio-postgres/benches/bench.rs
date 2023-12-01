@@ -3,12 +3,12 @@ use futures_channel::oneshot;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::runtime::Runtime;
-use tokio_postgres::{Client, NoTls};
+use yb_tokio_postgres::{Client, NoTls};
 
 fn setup() -> (Client, Runtime) {
     let runtime = Runtime::new().unwrap();
     let (client, conn) = runtime
-        .block_on(tokio_postgres::connect(
+        .block_on(yb_tokio_postgres::connect(
             "host=localhost port=5433 user=postgres",
             NoTls,
         ))

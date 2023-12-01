@@ -2,7 +2,7 @@ use crate::connection::ConnectionRef;
 use fallible_iterator::FallibleIterator;
 use futures_util::StreamExt;
 use std::pin::Pin;
-use tokio_postgres::{Error, Row, RowStream};
+use yb_tokio_postgres::{Error, Row, RowStream};
 
 /// The iterator returned by `query_raw`.
 pub struct RowIter<'a> {

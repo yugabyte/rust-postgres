@@ -3,9 +3,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use postgres::{Client, NoTls};
+//! use yb_postgres::{Client, NoTls};
 //!
-//! # fn main() -> Result<(), postgres::Error> {
+//! # fn main() -> Result<(), yb_postgres::Error> {
 //! let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
 //!
 //! client.batch_execute("
@@ -37,7 +37,7 @@
 //! # Implementation
 //!
 //! This crate is a lightweight wrapper over tokio-postgres. The `postgres::Client` is simply a wrapper around a
-//! `tokio_postgres::Client` along side a tokio `Runtime`. The client simply blocks on the futures provided by the async
+//! `yb_tokio_postgres::Client` along side a tokio `Runtime`. The client simply blocks on the futures provided by the async
 //! client.
 //!
 //! # SSL/TLS support
@@ -67,7 +67,7 @@
 #![warn(clippy::all, rust_2018_idioms, missing_docs)]
 
 pub use fallible_iterator;
-pub use tokio_postgres::{
+pub use yb_tokio_postgres::{
     error, row, tls, types, Column, IsolationLevel, Notification, Portal, SimpleQueryMessage,
     Socket, Statement, ToStatement,
 };

@@ -8,4 +8,4 @@ edition = "2018"
 trybuild = "1.0"
 
 postgres-types = { path = "../postgres-types", features = ["derive"] }
-postgres = { path = "../postgres" }
+postgres = "0.19.7"

@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::result;
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio_postgres::types::{FromSql, FromSqlOwned, IsNull, Kind, PgLsn, ToSql, Type, WrongType};
+use yb_tokio_postgres::types::{FromSql, FromSqlOwned, IsNull, Kind, PgLsn, ToSql, Type, WrongType};
 
 use crate::connect;
 use bytes::BytesMut;

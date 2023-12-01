@@ -5,14 +5,14 @@ use crate::{
 };
 use std::task::Poll;
 use std::time::Duration;
-use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
-use tokio_postgres::types::{BorrowToSql, ToSql, Type};
-use tokio_postgres::{Error, Row, SimpleQueryMessage, Socket, close};
+use yb_tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
+use yb_tokio_postgres::types::{BorrowToSql, ToSql, Type};
+use yb_tokio_postgres::{Error, Row, SimpleQueryMessage, Socket, close};
 
 /// A synchronous PostgreSQL client.
 pub struct Client {
     connection: Connection,
-    client: tokio_postgres::Client,
+    client: yb_tokio_postgres::Client,
 }
 
 impl Drop for Client {
@@ -23,7 +23,7 @@ impl Drop for Client {
 }
 
 impl Client {
-    pub(crate) fn new(connection: Connection, client: tokio_postgres::Client) -> Client {
+    pub(crate) fn new(connection: Connection, client: yb_tokio_postgres::Client) -> Client {
         Client { connection, client }
     }
 
@@ -61,9 +61,9 @@ impl Client {
     /// # Example
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let bar = 1i32;
@@ -96,9 +96,9 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let baz = true;
@@ -130,9 +130,9 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let baz = true;
@@ -164,9 +164,9 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let baz = true;
@@ -201,11 +201,11 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     /// use fallible_iterator::FallibleIterator;
     /// use std::iter;
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let baz = true;
@@ -223,10 +223,10 @@ impl Client {
     /// this the type must explicitly be converted to `&dyn ToSql`.
     ///
     /// ```no_run
-    /// # use postgres::{Client, NoTls};
-    /// use postgres::types::ToSql;
+    /// # use yb_postgres::{Client, NoTls};
+    /// use yb_postgres::types::ToSql;
     /// use fallible_iterator::FallibleIterator;
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// # let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let params: Vec<String> = vec![
@@ -266,9 +266,9 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let statement = client.prepare("SELECT name FROM people WHERE id = $1")?;
@@ -293,10 +293,10 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
-    /// use postgres::types::Type;
+    /// use yb_postgres::{Client, NoTls};
+    /// use yb_postgres::types::Type;
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let statement = client.prepare_typed(
@@ -328,7 +328,7 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     /// use std::io::Write;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -356,7 +356,7 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     /// use std::io::Read;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -430,7 +430,7 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
+    /// use yb_postgres::{Client, NoTls};
     ///
     /// # fn main() -> Result<(), postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
@@ -456,9 +456,9 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, IsolationLevel, NoTls};
+    /// use yb_postgres::{Client, IsolationLevel, NoTls};
     ///
-    /// # fn main() -> Result<(), postgres::Error> {
+    /// # fn main() -> Result<(), yb_postgres::Error> {
     /// let mut client = Client::connect("host=localhost user=postgres", NoTls)?;
     ///
     /// let mut transaction = client.build_transaction()
@@ -488,8 +488,8 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// use postgres::{Client, NoTls};
-    /// use postgres::error::SqlState;
+    /// use yb_postgres::{Client, NoTls};
+    /// use yb_postgres::error::SqlState;
     /// use std::thread;
     /// use std::time::Duration;
     ///

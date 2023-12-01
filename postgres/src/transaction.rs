@@ -1,7 +1,7 @@
 use crate::connection::ConnectionRef;
 use crate::{CancelToken, CopyInWriter, CopyOutReader, Portal, RowIter, Statement, ToStatement};
-use tokio_postgres::types::{BorrowToSql, ToSql, Type};
-use tokio_postgres::{Error, Row, SimpleQueryMessage};
+use yb_tokio_postgres::types::{BorrowToSql, ToSql, Type};
+use yb_tokio_postgres::{Error, Row, SimpleQueryMessage};
 
 /// A representation of a PostgreSQL database transaction.
 ///
@@ -9,7 +9,7 @@ use tokio_postgres::{Error, Row, SimpleQueryMessage};
 /// in the transaction. Transactions can be nested, with inner transactions implemented via savepoints.
 pub struct Transaction<'a> {
     connection: ConnectionRef<'a>,
-    transaction: Option<tokio_postgres::Transaction<'a>>,
+    transaction: Option<yb_tokio_postgres::Transaction<'a>>,
 }
 
 impl<'a> Drop for Transaction<'a> {
@@ -23,7 +23,7 @@ impl<'a> Drop for Transaction<'a> {
 impl<'a> Transaction<'a> {
     pub(crate) fn new(
         connection: ConnectionRef<'a>,
-        transaction: tokio_postgres::Transaction<'a>,
+        transaction: yb_tokio_postgres::Transaction<'a>,
     ) -> Transaction<'a> {
         Transaction {
             connection,
