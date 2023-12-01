@@ -9,7 +9,7 @@ documentation = "https://docs.yugabyte.com/stable/drivers-orms/rust/yb-rust-post
 description = "A native, synchronous YugabyteDB YSQL client"
 repository = "https://github.com/yugabyte/rust-postgres"
 readme = "../README.md"
-keywords = ["database", "postgres", "postgresql", "sql", "yugabyte", "yugabytedb", "ysql"]
+keywords = ["database", "postgres", "postgresql", "sql", "yugabytedb"]
 categories = ["database"]
 
 [[bench]]
