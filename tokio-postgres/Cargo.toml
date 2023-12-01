@@ -1,13 +1,13 @@
 [package]
-name = "tokio-postgres"
-version = "0.7.10"
+name = "yb-tokio-postgres"
+version = "0.7.10-yb-1-beta"
 authors = ["Steven Fackler <sfackler@gmail.com>"]
 edition = "2018"
 license = "MIT/Apache-2.0"
-description = "A native, asynchronous PostgreSQL client"
-repository = "https://github.com/sfackler/rust-postgres"
+description = "A native, asynchronous YugabyteDB YSQL client"
+repository = "https://github.com/yugabyte/rust-postgres"
 readme = "../README.md"
-keywords = ["database", "postgres", "postgresql", "sql", "async"]
+keywords = ["database", "postgres", "postgresql", "sql", "async", "yugabyte", "yugabytedb", "ysql"]
 categories = ["database"]
 
 [lib]
@@ -21,7 +21,7 @@ harness = false
 all-features = true
 
 [badges]
-circle-ci = { repository = "sfackler/rust-postgres" }
+circle-ci = { repository = "yugabyte/rust-postgres" }
 
 [features]
 default = ["runtime"]
