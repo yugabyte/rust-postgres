@@ -12,12 +12,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime;
 #[doc(inline)]
-pub use tokio_postgres::config::{
+pub use yb_tokio_postgres::config::{
     ChannelBinding, Host, LoadBalanceHosts, SslMode, TargetSessionAttrs,
 };
-use tokio_postgres::error::DbError;
-use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
-use tokio_postgres::{Error, Socket};
+use yb_tokio_postgres::error::DbError;
+use yb_tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
+use yb_tokio_postgres::{Error, Socket};
 
 /// Connection configuration.
 ///
@@ -143,7 +143,7 @@ use tokio_postgres::{Error, Socket};
 /// ```
 #[derive(Clone)]
 pub struct Config {
-    config: tokio_postgres::Config,
+    config: yb_tokio_postgres::Config,
     notice_callback: Arc<dyn Fn(DbError) + Send + Sync>,
 }
 
@@ -164,7 +164,7 @@ impl Default for Config {
 impl Config {
     /// Creates a new configuration.
     pub fn new() -> Config {
-        tokio_postgres::Config::new().into()
+        yb_tokio_postgres::Config::new().into()
     }
 
     /// Sets the user to authenticate with.
@@ -537,7 +537,7 @@ impl Config {
     /// Notices are distinct from notifications, which are instead accessible
     /// via the [`Notifications`] API.
     ///
-    /// [`AsyncMessage::Notice`]: tokio_postgres::AsyncMessage::Notice
+    /// [`AsyncMessage::Notice`]: yb_tokio_postgres::AsyncMessage::Notice
     /// [`Notifications`]: crate::Notifications
     pub fn notice_callback<F>(&mut self, f: F) -> &mut Config
     where
@@ -571,12 +571,12 @@ impl FromStr for Config {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Config, Error> {
-        s.parse::<tokio_postgres::Config>().map(Config::from)
+        s.parse::<yb_tokio_postgres::Config>().map(Config::from)
     }
 }
 
-impl From<tokio_postgres::Config> for Config {
-    fn from(config: tokio_postgres::Config) -> Config {
+impl From<yb_tokio_postgres::Config> for Config {
+    fn from(config: yb_tokio_postgres::Config) -> Config {
         Config {
             config,
             notice_callback: Arc::new(|notice| {

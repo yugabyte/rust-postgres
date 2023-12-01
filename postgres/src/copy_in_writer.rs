@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::SinkExt;
 use std::io;
 use std::io::Write;
-use tokio_postgres::{CopyInSink, Error};
+use yb_tokio_postgres::{CopyInSink, Error};
 
 /// The writer returned by the `copy_in` method.
 ///

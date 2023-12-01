@@ -340,8 +340,8 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn async_main(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    /// use tokio_postgres::types::ToSql;
+    /// # async fn async_main(client: &yb_tokio_postgres::Client) -> Result<(), yb_tokio_postgres::Error> {
+    /// use yb_tokio_postgres::types::ToSql;
     /// use futures_util::{pin_mut, TryStreamExt};
     ///
     /// let params: Vec<String> = vec![

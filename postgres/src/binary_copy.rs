@@ -7,8 +7,8 @@ use fallible_iterator::FallibleIterator;
 use futures_util::StreamExt;
 use std::pin::Pin;
 #[doc(inline)]
-pub use tokio_postgres::binary_copy::BinaryCopyOutRow;
-use tokio_postgres::binary_copy::{self, BinaryCopyOutStream};
+pub use yb_tokio_postgres::binary_copy::BinaryCopyOutRow;
+use yb_tokio_postgres::binary_copy::{self, BinaryCopyOutStream};
 
 /// A type which serializes rows into the PostgreSQL binary copy format.
 ///

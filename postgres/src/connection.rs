@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::runtime::Runtime;
-use tokio_postgres::error::DbError;
-use tokio_postgres::AsyncMessage;
+use yb_tokio_postgres::error::DbError;
+use yb_tokio_postgres::AsyncMessage;
 
 pub struct Connection {
     runtime: Runtime,
@@ -21,7 +21,7 @@ pub struct Connection {
 impl Connection {
     pub fn new<S, T>(
         runtime: Runtime,
-        connection: tokio_postgres::Connection<S, T>,
+        connection: yb_tokio_postgres::Connection<S, T>,
         notice_callback: Arc<dyn Fn(DbError) + Sync + Send>,
     ) -> Connection
     where
@@ -121,7 +121,7 @@ impl DerefMut for ConnectionRef<'_> {
 }
 
 struct ConnectionStream<S, T> {
-    connection: tokio_postgres::Connection<S, T>,
+    connection: yb_tokio_postgres::Connection<S, T>,
 }
 
 impl<S, T> Stream for ConnectionStream<S, T>

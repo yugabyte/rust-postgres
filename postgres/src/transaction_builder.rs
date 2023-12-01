@@ -4,13 +4,13 @@ use crate::{Error, IsolationLevel, Transaction};
 /// A builder for database transactions.
 pub struct TransactionBuilder<'a> {
     connection: ConnectionRef<'a>,
-    builder: tokio_postgres::TransactionBuilder<'a>,
+    builder: yb_tokio_postgres::TransactionBuilder<'a>,
 }
 
 impl<'a> TransactionBuilder<'a> {
     pub(crate) fn new(
         connection: ConnectionRef<'a>,
-        builder: tokio_postgres::TransactionBuilder<'a>,
+        builder: yb_tokio_postgres::TransactionBuilder<'a>,
     ) -> TransactionBuilder<'a> {
         TransactionBuilder {
             connection,

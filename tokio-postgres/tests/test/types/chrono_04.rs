@@ -1,7 +1,7 @@
 use chrono_04::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use std::fmt;
-use tokio_postgres::types::{Date, FromSqlOwned, Timestamp};
-use tokio_postgres::Client;
+use yb_tokio_postgres::types::{Date, FromSqlOwned, Timestamp};
+use yb_tokio_postgres::Client;
 
 use crate::connect;
 use crate::types::test_type;
