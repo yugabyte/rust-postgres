@@ -13,7 +13,7 @@
 //! builder.set_ca_file("database_cert.pem")?;
 //! let connector = MakeTlsConnector::new(builder.build());
 //!
-//! let connect_future = tokio_postgres::connect(
+//! let connect_future = yb_tokio_postgres::connect(
 //!     "host=localhost user=postgres sslmode=require",
 //!     connector,
 //! );
@@ -35,7 +35,7 @@
 //! builder.set_ca_file("database_cert.pem")?;
 //! let connector = MakeTlsConnector::new(builder.build());
 //!
-//! let client = postgres::Client::connect(
+//! let client = yb_postgres::Client::connect(
 //!     "host=localhost user=postgres sslmode=require",
 //!     connector,
 //! )?;
@@ -65,10 +65,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio_openssl::SslStream;
-use tokio_postgres::tls;
+use yb_tokio_postgres::tls;
 #[cfg(feature = "runtime")]
-use tokio_postgres::tls::MakeTlsConnect;
-use tokio_postgres::tls::{ChannelBinding, TlsConnect};
+use yb_tokio_postgres::tls::MakeTlsConnect;
+use yb_tokio_postgres::tls::{ChannelBinding, TlsConnect};
 
 #[cfg(test)]
 mod test;
