@@ -17,6 +17,7 @@ use std::task::Poll;
 use std::time::Instant;
 use std::{cmp, io};
 use tokio::net;
+use tokio::sync::Mutex as TokioMutex;
 
 lazy_static! {
     static ref CONNECTION_COUNT_MAP: Mutex<HashMap<Host, i64>> = {
@@ -31,9 +32,9 @@ lazy_static! {
         }
         Mutex::new(m)
     };
-    static ref LAST_TIME_META_DATA_FETCHED: Mutex<Instant> = {
+    static ref LAST_TIME_META_DATA_FETCHED: TokioMutex<Instant> = {
         let m = Instant::now();
-        Mutex::new(m)
+        TokioMutex::new(m)
     };
     static ref HOST_INFO: Mutex<Vec<Host>> = {
         let m = Vec::new();
@@ -350,7 +351,7 @@ fn get_least_loaded_server(config: &Config) -> Option<Host> {
 }
 
 async fn check_and_refresh(config: &Config) -> bool {
-    let mut refresh_time = LAST_TIME_META_DATA_FETCHED.lock().unwrap();
+    let mut refresh_time = LAST_TIME_META_DATA_FETCHED.lock().await;
     let host_list = HOST_INFO.lock().unwrap().clone();
     if host_list.len() == 0 {
         info!("Connecting to the server for the first time");
@@ -448,17 +449,18 @@ async fn refresh(client: Client, config: &Config) {
         control_conn_host = socket_config.unwrap().hostname.unwrap();
     }
 
+    info!("Executing query: `select * from yb_servers()` to fetch list of servers");
+    let rows = client
+        .query("select * from yb_servers()", &[])
+        .await
+        .unwrap();
+
     let mut host_list = HOST_INFO.lock().unwrap();
     let mut failed_host_list = FAILED_HOSTS.lock().unwrap();
     let mut placement_info_map = PLACEMENT_INFO_MAP.lock().unwrap();
     let mut public_host_map = PUBLIC_HOST_MAP.lock().unwrap();
     let mut host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap();
-    info!("Executing query: `select * from yb_servers()` to fetch list of servers");
-    for row in client
-        .query("select * from yb_servers()", &[])
-        .await
-        .unwrap()
-    {
+    for row in rows {
         let host_string: String = row.get("host");
         let host = Host::Tcp(host_string.to_string());
         info!("Received entry for host {:?}", host);
