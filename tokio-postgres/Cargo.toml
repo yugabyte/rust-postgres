@@ -63,7 +63,6 @@ tokio-util = { version = "0.7", features = ["codec"] }
 rand = "0.8.5"
 whoami = "1.4.1"
 lazy_static = "1.4.0"
-env_logger = "0.10.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 socket2 = { version = "0.5", features = ["all"] }
