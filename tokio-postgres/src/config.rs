@@ -12,7 +12,6 @@ use crate::tls::TlsConnect;
 #[cfg(feature = "runtime")]
 use crate::Socket;
 use crate::{Client, Connection, Error};
-use env_logger::{Builder, Target};
 use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -25,21 +24,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str;
 use std::str::FromStr;
-use std::sync::Once;
 use std::time::Duration;
 use std::{error, fmt, iter, mem};
 use tokio::io::{AsyncRead, AsyncWrite};
-
-static INIT: Once = Once::new();
-
-fn logger_setup() {
-    let mut builder = Builder::from_default_env();
-    builder.target(Target::Stdout);
-
-    INIT.call_once(|| {
-        builder.init();
-    });
-}
 
 /// Properties required of a session.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -895,7 +882,6 @@ impl Config {
         T: MakeTlsConnect<Socket>,
     {
         if self.load_balance == true {
-            logger_setup();
             yb_connect(tls, self).await
         } else {
             connect(tls, self).await
