@@ -2,7 +2,7 @@
 
 #[cfg(feature = "runtime")]
 use crate::connect::connect;
-use crate::connect::{yb_connect, PLACEMENT_INFO_MAP};
+use crate::connect::yb_connect;
 use crate::connect_raw::connect_raw;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::keepalive::KeepaliveConfig;
@@ -147,7 +147,8 @@ pub enum Host {
 ///     `disable`, hosts and addresses will be tried in the order provided. If set to `random`, hosts will be tried
 ///     in a random order, and the IP addresses resolved from a hostname will also be tried in a random order. Defaults
 ///     to `disable`.
-/// * `load_balance` -  It expects true/false as its possible values. Default value is true.
+/// * `load_balance` -  Defaults to upstream driver behavior unless set to one of the allowed values (true or any, only-rr, only-primary,
+///     prefer-primary, prefer-rr and false) other than 'false'.
 /// * `topology_keys` - It takes a comma separated geo-location values. A single geo-location can be given as 'cloud.region.zone'.
 ///     Multiple geo-locations too can be specified, separated by comma (,). Each placement value can be suffixed with a colon (:)
 ///     followed by a preference value between 1 and 10. A preference value of :1 means it is a primary placement. A preference
@@ -226,7 +227,7 @@ pub struct Config {
     pub(crate) channel_binding: ChannelBinding,
     pub(crate) load_balance_hosts: LoadBalanceHosts,
     /// YugabyteDB Specific
-    pub(crate) load_balance: bool,
+    pub(crate) load_balance: String,
     pub(crate) topology_keys: HashMap<i64, Vec<String>>,
     pub(crate) yb_servers_refresh_interval: Duration,
     pub(crate) fallback_to_topology_keys_only: bool,
@@ -264,7 +265,7 @@ impl Config {
             target_session_attrs: TargetSessionAttrs::Any,
             channel_binding: ChannelBinding::Prefer,
             load_balance_hosts: LoadBalanceHosts::Disable,
-            load_balance: false,
+            load_balance: String::from("false"),
             topology_keys: HashMap::new(),
             yb_servers_refresh_interval: Duration::new(300, 0),
             fallback_to_topology_keys_only: false,
@@ -554,16 +555,16 @@ impl Config {
     /// Sets the load balance parameter.
     ///
     /// Defaults to false.
-    pub fn load_balance(&mut self, load_balance: bool) -> &mut Config {
-        self.load_balance = load_balance;
+    pub fn load_balance(&mut self, load_balance: &str) -> &mut Config {
+        self.load_balance = load_balance.to_lowercase();
         self
     }
 
     /// YugabyteDB Specific.
     ///
     /// Gets the load balance value
-    pub fn get_load_balance(&self) -> bool {
-        self.load_balance
+    pub fn get_load_balance(&self) -> String {
+        self.load_balance.clone()
     }
 
     /// YugabyteDB Specific.
@@ -652,6 +653,20 @@ impl Config {
         self.failed_host_reconnect_delay_secs
     }
 
+    ///Check if the given load_balnce value if one of the allowed values.
+    pub fn is_lb_valid(&self, lb: &str) -> bool {
+        match lb.to_lowercase().as_str(){
+            "only-rr" => return true,
+            "only-primary"=> return true,
+            "prefer-primary"=> return true,
+            "prefer-rr"=> return true,
+            "any"=> return true,
+            "true"=> return true,
+            "false"=> return true,
+            _=>return false,
+        };
+    }
+
     ///Check if a given zone in Topology keys is valid
     pub fn is_valid(&self, zone: &str) -> bool {
         let mut zones: Vec<&str> = zone.split(":").collect();
@@ -673,13 +688,6 @@ impl Config {
             if priorityvalue < 1 || priorityvalue > 10 {
                 return false;
             }
-        }
-        let placementinfo = PLACEMENT_INFO_MAP.lock().unwrap().clone();
-        if placement[2] != "*" {
-            placementinfo.contains_key(zones[0]);
-        } else {
-            let starplacement: String = placement[0].to_owned() + placement[1];
-            placementinfo.contains_key(&starplacement);
         }
         true
     }
@@ -820,10 +828,11 @@ impl Config {
                 self.load_balance_hosts(load_balance_hosts);
             }
             "load_balance" => {
-                let load_balance = value
-                    .parse::<bool>()
-                    .map_err(|_| Error::config_parse(Box::new(InvalidValue("load_balance"))))?;
-                self.load_balance(load_balance);
+                if self.is_lb_valid(value) {
+                    self.load_balance(value);
+                } else {
+                    return Err(Error::config_parse(Box::new(InvalidValue("load_balance"))));
+                }
             }
             "topology_keys" => {
                 for topology_keys in value.split(',') {
@@ -881,7 +890,7 @@ impl Config {
     where
         T: MakeTlsConnect<Socket>,
     {
-        if self.load_balance == true {
+        if self.load_balance != "false" {
             yb_connect(tls, self).await
         } else {
             connect(tls, self).await

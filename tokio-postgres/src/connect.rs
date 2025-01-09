@@ -15,14 +15,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Instant;
-use std::{cmp, io};
+use std::{cmp, io, vec};
 use tokio::net;
 use tokio::sync::Mutex as TokioMutex;
 
 lazy_static! {
     static ref CONNECTION_COUNT_MAP: Mutex<HashMap<Host, i64>> = {
         let mut m = HashMap::new();
-        let host_list = HOST_INFO.lock().unwrap().clone();
+        let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
+        let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
+        let host_list = vec![host_list_primary, host_list_rr].concat();
         let size = host_list.len();
         for i in 0..size {
             let host = host_list.get(i);
@@ -36,7 +38,11 @@ lazy_static! {
         let m = Instant::now();
         TokioMutex::new(m)
     };
-    static ref HOST_INFO: Mutex<Vec<Host>> = {
+    static ref HOST_INFO_PRIMAY: Mutex<Vec<Host>> = {
+        let m = Vec::new();
+        Mutex::new(m)
+    };
+    static ref HOST_INFO_RR: Mutex<Vec<Host>> = {
         let m = Vec::new();
         Mutex::new(m)
     };
@@ -44,7 +50,11 @@ lazy_static! {
         let m = HashMap::new();
         Mutex::new(m)
     };
-    pub(crate) static ref PLACEMENT_INFO_MAP: Mutex<HashMap<String, Vec<Host>>> = {
+    pub(crate) static ref PLACEMENT_INFO_MAP_PRIMARY: Mutex<HashMap<String, Vec<Host>>> = {
+        let m = HashMap::new();
+        Mutex::new(m)
+    };
+    pub(crate) static ref PLACEMENT_INFO_MAP_RR: Mutex<HashMap<String, Vec<Host>>> = {
         let m = HashMap::new();
         Mutex::new(m)
     };
@@ -177,10 +187,10 @@ where
     loop {
         let newhost = get_least_loaded_server(config);
         let mut host = match newhost {
-            Some(host) => host,
-            None => {
-                // Fallback to original behaviour
-                return connect(tls, config).await;
+            Ok(host) => host,
+            Err(e) => {
+                // Throw the error
+                return Err(e);
             }
         };
 
@@ -262,14 +272,36 @@ pub(crate) fn decrease_connection_count(host: Host) {
     }
 }
 
-fn get_least_loaded_server(config: &Config) -> Option<Host> {
+fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
     let conn_map = CONNECTION_COUNT_MAP.lock().unwrap().clone();
-    let host_list = HOST_INFO.lock().unwrap().clone();
+    let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
+    let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
     let failed_host_list = FAILED_HOSTS.lock().unwrap().clone();
-    let placement_info_map = PLACEMENT_INFO_MAP.lock().unwrap().clone();
-
-    let mut min_count = MAX;
+    let placement_info_map_primary = PLACEMENT_INFO_MAP_PRIMARY.lock().unwrap().clone();
+    let placement_info_map_rr = PLACEMENT_INFO_MAP_RR.lock().unwrap().clone();
     let mut least_host: Vec<Host> = Vec::new();
+
+    let mut host_list: Vec<Host> = Vec::new();
+    let mut placement_info_map: HashMap<String, Vec<Host>> = HashMap::new();
+
+    if config.load_balance == "only-rr" || config.load_balance == "prefer-rr" {
+        host_list = host_list_rr.clone();
+        placement_info_map = placement_info_map_rr.clone();
+    } else if config.load_balance == "only-primary" || config.load_balance == "prefer-primary" {
+        host_list = host_list_primary.clone();
+        placement_info_map = placement_info_map_primary.clone();
+    } else {
+        host_list = host_list_rr.clone();
+        placement_info_map = placement_info_map_rr.clone();
+        host_list.extend(host_list_primary.clone());
+        for (key, value) in placement_info_map_primary {
+            if let Some(vec) = placement_info_map.get_mut(&key) {
+                vec.extend(value);
+            } else {
+                placement_info_map.insert(key, value);
+            }
+        }
+    }
 
     if !config.topology_keys.is_empty() {
         for i in 0..config.topology_keys.len() as i64 {
@@ -291,50 +323,33 @@ fn get_least_loaded_server(config: &Config) -> Option<Host> {
                     }
                 }
             }
-            for host in server.iter() {
-                if !failed_host_list.contains_key(host) {
-                    let count = conn_map.get(host);
-                    let mut counter: i64 = 0;
-                    if !count.is_none() {
-                        counter = *count.unwrap();
-                    }
-                    if min_count > counter {
-                        min_count = counter;
-                        least_host.clear();
-                        least_host.push(host.clone());
-                    } else if min_count == counter {
-                        least_host.push(host.clone());
-                    }
-                }
-            }
+            least_host = get_least_loaded_hosts(server, conn_map.clone(), failed_host_list.clone());
 
-            if min_count != MAX && least_host.len() != 0 {
+            if least_host.len() != 0 {
                 break;
             }
         }
     }
 
-    if min_count == MAX && least_host.len() == 0 {
-        if config.topology_keys.is_empty() || !config.fallback_to_topology_keys_only {
-            for i in 0..host_list.len() {
-                let host = &host_list[i];
-                if !failed_host_list.contains_key(host) {
-                    let count = conn_map.get(host);
-                    let mut counter: i64 = 0;
-                    if !count.is_none() {
-                        counter = *count.unwrap();
-                    }
-                    if min_count > counter {
-                        min_count = counter;
-                        least_host.clear();
-                        least_host.push(host.clone());
-                    } else if min_count == counter {
-                        least_host.push(host.clone());
-                    }
-                }
+    if least_host.len() == 0 {
+        if !(config.load_balance == "prefer-primary" || config.load_balance == "prefer-rr") {
+            if config.topology_keys.is_empty() || !config.fallback_to_topology_keys_only {
+                least_host = get_least_loaded_hosts(host_list, conn_map.clone(), failed_host_list.clone());
+            } else {
+                return Err(Error::connect(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "no preferred server available, fallback-to-topology-keys-only is set to true",
+                )));
             }
         } else {
-            return None;
+            least_host = get_least_loaded_hosts(host_list, conn_map.clone(), failed_host_list.clone());
+            if least_host.len() == 0 {
+                if config.load_balance == "prefer-rr"{
+                    least_host = get_least_loaded_hosts(host_list_primary, conn_map.clone(), failed_host_list.clone());
+                } else {
+                    least_host = get_least_loaded_hosts(host_list_rr, conn_map.clone(), failed_host_list.clone());
+                }
+            }
         }
     }
 
@@ -344,15 +359,42 @@ fn get_least_loaded_server(config: &Config) -> Option<Host> {
             least_host
         );
         let num = rand::thread_rng().gen_range(0..least_host.len());
-        return least_host.get(num).cloned();
+        return Ok(least_host.get(num).cloned().expect("least loaded host value is None"));
     } else {
-        return None;
+        return Err(Error::connect(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "could not find a server to connect to",
+        )));
     }
+}
+
+fn get_least_loaded_hosts(hosts: Vec<Host>, conn_map: HashMap<Host, i64>, failed_hosts: HashMap<Host, Instant>) -> Vec<Host> {
+    let mut min_count = MAX;
+    let mut least_host: Vec<Host> = Vec::new();
+    for host in hosts.iter() {
+        if !failed_hosts.contains_key(host) {
+            let count = conn_map.get(host);
+            let mut counter: i64 = 0;
+            if !count.is_none() {
+                counter = *count.unwrap();
+            }
+            if min_count > counter {
+                min_count = counter;
+                least_host.clear();
+                least_host.push(host.clone());
+            } else if min_count == counter {
+                least_host.push(host.clone());
+            }
+        }
+    }
+    return least_host
 }
 
 async fn check_and_refresh(config: &Config) -> bool {
     let mut refresh_time = LAST_TIME_META_DATA_FETCHED.lock().await;
-    let host_list = HOST_INFO.lock().unwrap().clone();
+    let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
+    let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
+    let host_list = vec![host_list_primary, host_list_rr].concat();
     if host_list.len() == 0 {
         info!("Connecting to the server for the first time");
         if let Ok((client, connection)) = connect(NoTls, config).await {
@@ -455,15 +497,18 @@ async fn refresh(client: Client, config: &Config) {
         .await
         .unwrap();
 
-    let mut host_list = HOST_INFO.lock().unwrap();
+    let mut host_list_primary = HOST_INFO_PRIMAY.lock().unwrap();
+    let mut host_list_rr = HOST_INFO_RR.lock().unwrap();
     let mut failed_host_list = FAILED_HOSTS.lock().unwrap();
-    let mut placement_info_map = PLACEMENT_INFO_MAP.lock().unwrap();
+    let mut placement_info_map_primary = PLACEMENT_INFO_MAP_PRIMARY.lock().unwrap();
+    let mut placement_info_map_rr = PLACEMENT_INFO_MAP_RR.lock().unwrap();
     let mut public_host_map = PUBLIC_HOST_MAP.lock().unwrap();
     let mut host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap();
     for row in rows {
         let host_string: String = row.get("host");
         let host = Host::Tcp(host_string.to_string());
         info!("Received entry for host {:?}", host);
+        let nodetype: String = row.get("node_type");
         let portvalue: i64 = row.get("port");
         let port: u16 = portvalue as u16;
         let cloud: String = row.get("cloud");
@@ -482,10 +527,18 @@ async fn refresh(client: Client, config: &Config) {
         }
 
         if !failed_host_list.contains_key(&host) {
-            if !host_list.contains(&host) {
-                host_list.push(host.clone());
-                public_host_map.insert(host.clone(), public_ip.clone());
-                debug!("Added {:?} to host list", host.clone());
+            if nodetype == "primary" {
+                if !host_list_primary.contains(&host) {
+                    host_list_primary.push(host.clone());
+                    public_host_map.insert(host.clone(), public_ip.clone());
+                    debug!("Added {:?} to host list primary", host.clone());
+                }
+            } else {
+                if !host_list_rr.contains(&host) {
+                    host_list_rr.push(host.clone());
+                    public_host_map.insert(host.clone(), public_ip.clone());
+                    debug!("Added {:?} to host list RR", host.clone());
+                }
             }
         } else {
             if failed_host_list.get(&host).unwrap().elapsed()
@@ -496,47 +549,90 @@ async fn refresh(client: Client, config: &Config) {
                     "Marking {:?} as UP since failed-host-reconnect-delay-secs has elapsed",
                     host.clone()
                 );
-                if !host_list.contains(&host) {
-                    host_list.push(host.clone());
-                    public_host_map.insert(host.clone(), public_ip.clone());
+                if nodetype == "primary" {
+                    if !host_list_primary.contains(&host) {
+                        host_list_primary.push(host.clone());
+                        public_host_map.insert(host.clone(), public_ip.clone());
+                        debug!("Added {:?} to host list primary", host.clone());
+                    }
+                } else {
+                    if !host_list_rr.contains(&host) {
+                        host_list_rr.push(host.clone());
+                        public_host_map.insert(host.clone(), public_ip.clone());
+                        debug!("Added {:?} to host list RR", host.clone());
+                    }
                 }
                 make_connection_count_zero(host.clone());
-            } else if host_list.contains(&host) {
+            } else if host_list_primary.contains(&host) || host_list_rr.contains(&host) {
                 debug!(
                     "Treating {:?} as DOWN since failed-host-reconnect-delay-secs has not elapsed",
                     host.clone()
                 );
-                let index = host_list.iter().position(|x| *x == host).unwrap();
-                host_list.remove(index);
+                if host_list_primary.contains(&host) {
+                    let index = host_list_primary.iter().position(|x| *x == host).unwrap();
+                    host_list_primary.remove(index);
+                } else {
+                    let index = host_list_rr.iter().position(|x| *x == host).unwrap();
+                    host_list_rr.remove(index);
+                }
                 public_host_map.remove(&host);
             }
         }
 
-        if placement_info_map.contains_key(&placement_zone) {
-            let mut present_hosts = placement_info_map.get(&placement_zone).unwrap().to_vec();
-            if !present_hosts.contains(&host) {
-                present_hosts.push(host.clone());
-                placement_info_map.insert(placement_zone, present_hosts.to_vec());
+        if nodetype == "primary" {
+            if placement_info_map_primary.contains_key(&placement_zone) {
+                let mut present_hosts = placement_info_map_primary.get(&placement_zone).unwrap().to_vec();
+                if !present_hosts.contains(&host) {
+                    present_hosts.push(host.clone());
+                    placement_info_map_primary.insert(placement_zone.clone(), present_hosts.to_vec());
+                }
+            } else {
+                let mut host_vec: Vec<Host> = Vec::new();
+                host_vec.push(host.clone());
+                placement_info_map_primary.insert(placement_zone.clone(), host_vec);
             }
-        } else {
-            let mut host_vec: Vec<Host> = Vec::new();
-            host_vec.push(host.clone());
-            placement_info_map.insert(placement_zone, host_vec);
-        }
 
-        if placement_info_map.contains_key(&star_placement_zone) {
-            let mut star_present_hosts = placement_info_map
-                .get(&star_placement_zone)
-                .unwrap()
-                .to_vec();
-            if !star_present_hosts.contains(&host) {
-                star_present_hosts.push(host.clone());
-                placement_info_map.insert(star_placement_zone, star_present_hosts.to_vec());
+            if placement_info_map_primary.contains_key(&star_placement_zone) {
+                let mut star_present_hosts = placement_info_map_primary
+                    .get(&star_placement_zone)
+                    .unwrap()
+                    .to_vec();
+                if !star_present_hosts.contains(&host) {
+                    star_present_hosts.push(host.clone());
+                    placement_info_map_primary.insert(star_placement_zone.clone(), star_present_hosts.to_vec());
+                }
+            } else {
+                let mut star_host_vec: Vec<Host> = Vec::new();
+                star_host_vec.push(host.clone());
+                placement_info_map_primary.insert(star_placement_zone.clone(), star_host_vec);
             }
         } else {
-            let mut star_host_vec: Vec<Host> = Vec::new();
-            star_host_vec.push(host.clone());
-            placement_info_map.insert(star_placement_zone, star_host_vec);
+            if placement_info_map_rr.contains_key(&placement_zone) {
+                let mut present_hosts = placement_info_map_rr.get(&placement_zone).unwrap().to_vec();
+                if !present_hosts.contains(&host) {
+                    present_hosts.push(host.clone());
+                    placement_info_map_rr.insert(placement_zone, present_hosts.to_vec());
+                }
+            } else {
+                let mut host_vec: Vec<Host> = Vec::new();
+                host_vec.push(host.clone());
+                placement_info_map_rr.insert(placement_zone, host_vec);
+            }
+
+            if placement_info_map_rr.contains_key(&star_placement_zone) {
+                let mut star_present_hosts = placement_info_map_rr
+                    .get(&star_placement_zone)
+                    .unwrap()
+                    .to_vec();
+                if !star_present_hosts.contains(&host) {
+                    star_present_hosts.push(host.clone());
+                    placement_info_map_rr.insert(star_placement_zone, star_present_hosts.to_vec());
+                }
+            } else {
+                let mut star_host_vec: Vec<Host> = Vec::new();
+                star_host_vec.push(host.clone());
+                placement_info_map_rr.insert(star_placement_zone, star_host_vec);
+            }
         }
     }
 }
