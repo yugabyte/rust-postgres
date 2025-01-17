@@ -10,12 +10,11 @@ use log::{debug, info};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashMap;
-use std::i64::MAX;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Instant;
-use std::{cmp, io, vec};
+use std::{cmp, io};
 use tokio::net;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -24,11 +23,11 @@ lazy_static! {
         let mut m = HashMap::new();
         let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
         let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
-        let host_list = vec![host_list_primary, host_list_rr].concat();
+        let host_list = [host_list_primary, host_list_rr].concat();
         let size = host_list.len();
         for i in 0..size {
             let host = host_list.get(i);
-            if !host.is_none() {
+            if host.is_some() {
                 m.insert(host.unwrap().clone(), 0);
             }
         }
@@ -245,7 +244,7 @@ fn increase_connection_count(host: Host) {
         debug!("Increasing connection count for {:?} to 1", host.clone());
     } else {
         let mut conn_count: i64 = *count.unwrap();
-        conn_count = conn_count + 1;
+        conn_count += 1;
         conn_map.insert(host.clone(), conn_count);
         debug!(
             "Increasing connection count for {:?} by one: {}",
@@ -258,10 +257,10 @@ fn increase_connection_count(host: Host) {
 pub(crate) fn decrease_connection_count(host: Host) {
     let mut conn_map = CONNECTION_COUNT_MAP.lock().unwrap();
     let count = conn_map.get(&host);
-    if !count.is_none() {
+    if count.is_some() {
         let mut conn_count: i64 = *count.unwrap();
         if conn_count != 0 {
-            conn_count = conn_count - 1;
+            conn_count -= 1;
             conn_map.insert(host.clone(), conn_count);
             debug!(
                 "Decremented connection count for {:?} by one: {}",
@@ -311,27 +310,27 @@ fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
                 let to_check_star: Vec<&str> = placement_info.split(".").collect();
                 if to_check_star[2] == "*" {
                     let star_placement_info: String =
-                        to_check_star[0].to_owned() + "." + &to_check_star[1];
+                        to_check_star[0].to_owned() + "." + to_check_star[1];
                     let append_hosts = placement_info_map.get(&star_placement_info);
-                    if !append_hosts.is_none() {
-                        server.extend(append_hosts.unwrap().to_owned());
+                    if let Some(append_hosts_value) = append_hosts {
+                        server.extend(append_hosts_value.to_owned());
                     }
                 } else {
                     let append_hosts = placement_info_map.get(placement_info);
-                    if !append_hosts.is_none() {
-                        server.extend(append_hosts.unwrap().to_owned());
+                    if let Some(append_hosts_value) = append_hosts {
+                        server.extend(append_hosts_value.to_owned());
                     }
                 }
             }
             least_host = get_least_loaded_hosts(server, conn_map.clone(), failed_host_list.clone());
 
-            if least_host.len() != 0 {
+            if !least_host.is_empty() {
                 break;
             }
         }
     }
 
-    if least_host.len() == 0 {
+    if least_host.is_empty() {
         if !(config.load_balance == "prefer-primary" || config.load_balance == "prefer-rr") {
             if config.topology_keys.is_empty() || !config.fallback_to_topology_keys_only {
                 least_host = get_least_loaded_hosts(host_list, conn_map.clone(), failed_host_list.clone());
@@ -343,7 +342,7 @@ fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
             }
         } else {
             least_host = get_least_loaded_hosts(host_list, conn_map.clone(), failed_host_list.clone());
-            if least_host.len() == 0 {
+            if least_host.is_empty() {
                 if config.load_balance == "prefer-rr"{
                     least_host = get_least_loaded_hosts(host_list_primary, conn_map.clone(), failed_host_list.clone());
                 } else {
@@ -353,29 +352,29 @@ fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
         }
     }
 
-    if least_host.len() != 0 {
+    if !least_host.is_empty() {
         info!(
             "Following hosts have the least number of connections: {:?}, chosing one randomly",
             least_host
         );
         let num = rand::thread_rng().gen_range(0..least_host.len());
-        return Ok(least_host.get(num).cloned().expect("least loaded host value is None"));
+        Ok(least_host.get(num).cloned().expect("least loaded host value is None"))
     } else {
-        return Err(Error::connect(io::Error::new(
+        Err(Error::connect(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "could not find a server to connect to",
-        )));
+        )))
     }
 }
 
 fn get_least_loaded_hosts(hosts: Vec<Host>, conn_map: HashMap<Host, i64>, failed_hosts: HashMap<Host, Instant>) -> Vec<Host> {
-    let mut min_count = MAX;
+    let mut min_count = i64::MAX;
     let mut least_host: Vec<Host> = Vec::new();
     for host in hosts.iter() {
         if !failed_hosts.contains_key(host) {
             let count = conn_map.get(host);
             let mut counter: i64 = 0;
-            if !count.is_none() {
+            if count.is_some() {
                 counter = *count.unwrap();
             }
             if min_count > counter {
@@ -387,15 +386,15 @@ fn get_least_loaded_hosts(hosts: Vec<Host>, conn_map: HashMap<Host, i64>, failed
             }
         }
     }
-    return least_host
+    least_host
 }
 
 async fn check_and_refresh(config: &Config) -> bool {
     let mut refresh_time = LAST_TIME_META_DATA_FETCHED.lock().await;
     let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
     let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
-    let host_list = vec![host_list_primary, host_list_rr].concat();
-    if host_list.len() == 0 {
+    let host_list = [host_list_primary, host_list_rr].concat();
+    if host_list.is_empty() {
         info!("Connecting to the server for the first time");
         if let Ok((client, connection)) = connect(NoTls, config).await {
             let handle = tokio::spawn(async move {
@@ -429,7 +428,7 @@ async fn check_and_refresh(config: &Config) -> bool {
                     if public_host.is_none() {
                         info!("Public host not available for private host {:?}, adding this to failed host list and trying another server", conn_host.clone());
                         add_to_failed_host_list(host.cloned().unwrap());
-                        index = index + 1;
+                        index += 1;
                         continue;
                     } else {
                         conn_host = public_host.unwrap().clone();
@@ -468,14 +467,14 @@ async fn check_and_refresh(config: &Config) -> bool {
                 } else {
                     info!("Failed to establish control connection to {:?}, adding this to failed host list and trying another server", hostname.clone());
                     add_to_failed_host_list(host.cloned().unwrap());
-                    index = index + 1;
+                    index += 1;
                 }
             }
             info!("Failed to establish control connection to available servers");
             return false;
         }
     }
-    return true;
+    true
 }
 
 fn add_to_failed_host_list(host: Host) {
