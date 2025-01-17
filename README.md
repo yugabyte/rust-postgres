@@ -2,7 +2,7 @@
 
 This is a Rust driver for YugabyteDB SQL. This driver is based on [sfackler/rust-postgres](https://github.com/sfackler/rust-postgres), with the following additional connection properties:
 
-- `load_balance`   - It expects **true/false** as its possible values.
+- `load_balance`   - It expects **any/only-primary/only-rr/prefer-primary/prefer-rr/true/false** as its possible values.
 - `topology_keys`  - It takes a comma separated geo-location values. A single geo-location can be given as 'cloud.region.zone'. Multiple geo-locations too can be specified, separated by comma (`,`).
 - `yb_servers_refresh_interval` - (default value: 300 seconds) Time interval, in seconds, between two attempts to refresh the information about cluster nodes. Valid values are integers between 0 and 600. Value 0 means refresh for each connection request. Any value outside this range is ignored and the default is used.
 - `fallback_to_topology_keys_only` : (default value: false) Applicable only for TopologyAware Load Balancing. When set to true, the smart driver does not attempt to connect to servers outside of primary and fallback placements specified via property. The default behaviour is to fallback to any available server in the entire cluster.
@@ -16,10 +16,10 @@ Users can use this feature in two configurations.
 
 In the cluster-aware connection load balancing, connections are distributed across all the tservers in the cluster, irrespective of their placements.
 
-To enable the cluster-aware connection load balancing, provide the parameter `load_balance` set to true as `load_balance=true` in the connection url.
+To enable the cluster-aware connection load balancing, provide the parameter `load_balance` set to any (alias of true) as `load_balance=any` in the connection url.
 
 ```
-"postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=true"
+"postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=any"
 ```
 
 With this parameter specified in the url, the driver will fetch and maintain the list of tservers from the given endpoint (`127.0.0.1` in above example) available in the YugabyteDB cluster and distribute the connections equally across them.
@@ -34,7 +34,7 @@ With topology-aware connnection load balancing, users can target tservers in spe
 
 The connections will be distributed equally with the tservers in these zones.
 
-Note that, you would still need to specify `load_balance=true` to enable the topology-aware connection load balancing.
+Note that, you would still need to specify `load_balance` connection parameter to any of the [allowed values](#read-replica-cluster) other than `false` to enable the topology-aware connection load balancing.
 
 ```
 "postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=true&topology_keys=cloud1.datacenter1.rack1"
@@ -46,13 +46,13 @@ Each placement value can be suffixed with a colon (`:`) followed by a preference
 A preference value of `:1` means it is a primary placement. A preference value of `:2` means it is the first fallback placement and so on. If no preference value is provided, it is considered to be a primary placement (equivalent to one with preference value `:1`). Example given below.
 
 ```
-"postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=true&topology_keys=cloud1.region1.zone1:1,cloud1.region1.zone2:2";
+"postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=any&topology_keys=cloud1.region1.zone1:1,cloud1.region1.zone2:2";
 ```
 
 You can also use `*` for specifying all the zones in a given region as shown below. This is not allowed for cloud or region values.
 
 ```
-"postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=true&topology_keys=cloud1.region1.*:1,cloud1.region2.*:2";
+"postgresql://127.0.0.1:5433/yugabyte?user=yugabyte&password=yugabyte&load_balance=any&topology_keys=cloud1.region1.*:1,cloud1.region2.*:2";
 ```
 
 The driver attempts to connect to a node in following order: the least loaded node in the 1) primary placement(s), else in the 2) first fallback if specified, else in the 3) second fallback if specified and so on.
@@ -69,6 +69,24 @@ To specify Refresh Interval, use the parameter `yb_servers_refresh_interval` in 
 ```
 
 For working examples which demonstrates both the configurations of connection load balancing using `tokio-postgres::connect()`, see the [driver-examples](https://github.com/yugabyte/driver-examples/tree/main/rust/rust_ysql_driver_examples) repository.
+
+## Read Replica Cluster
+
+rust-postgres smart driver also enables load balancing across nodes in primary clusters which have associated Read Replica cluster.
+
+The connection property `load_balance` allows five values using which users can distribute connections among different combination of nodes as per their requirements:
+
+`only-rr` - Create connections only on Read Replica nodes
+
+`only-primary` - Create connections only on primary cluster nodes
+
+`prefer-rr` - Create connections on Read Replica nodes. If none available, on any node in the cluster including primary cluster nodes
+
+`prefer-primary` - Create connections on primary cluster nodes. If none available, on any node in the cluster including Read Replica nodes
+
+`any` or `true` - Equivalent to value true. Create connections on any node in the primary or Read Replica cluster
+
+default value is false
 
 PostgreSQL support for Rust.
 
