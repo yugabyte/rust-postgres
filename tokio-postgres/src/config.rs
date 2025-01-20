@@ -656,21 +656,21 @@ impl Config {
     ///Check if the given load_balnce value if one of the allowed values.
     pub fn is_lb_valid(&self, lb: &str) -> bool {
         match lb.to_lowercase().as_str(){
-            "only-rr" => return true,
-            "only-primary"=> return true,
-            "prefer-primary"=> return true,
-            "prefer-rr"=> return true,
-            "any"=> return true,
-            "true"=> return true,
-            "false"=> return true,
-            _=>return false,
-        };
+            "only-rr" => true,
+            "only-primary"=> true,
+            "prefer-primary"=> true,
+            "prefer-rr"=> true,
+            "any"=> true,
+            "true"=> true,
+            "false"=> true,
+            _=>false,
+        }
     }
 
     ///Check if a given zone in Topology keys is valid
     pub fn is_valid(&self, zone: &str) -> bool {
         let mut zones: Vec<&str> = zone.split(":").collect();
-        if zones.len() == 0 || zones.len() > 2 {
+        if zones.is_empty() || zones.len() > 2 {
             return false;
         }
         let placement: Vec<&str> = zones[0].split(".").collect();
@@ -685,7 +685,7 @@ impl Config {
             return false;
         } else {
             let priorityvalue = priority.unwrap();
-            if priorityvalue < 1 || priorityvalue > 10 {
+            if !(1..=10).contains(&priorityvalue) {
                 return false;
             }
         }
@@ -852,7 +852,7 @@ impl Config {
                 let refresh_interval = value.parse::<i64>().map_err(|_| {
                     Error::config_parse(Box::new(InvalidValue("yb_servers_refresh_interval")))
                 })?;
-                if refresh_interval >= 0 && refresh_interval <= 600 {
+                if (0..=600).contains(&refresh_interval) {
                     self.yb_servers_refresh_interval(Duration::from_secs(refresh_interval as u64));
                 }
             }
@@ -866,7 +866,7 @@ impl Config {
                 let failed_host_reconnect_delay_secs = value.parse::<i64>().map_err(|_| {
                     Error::config_parse(Box::new(InvalidValue("failed_host_reconnect_delay_secs")))
                 })?;
-                if failed_host_reconnect_delay_secs >= 0 && failed_host_reconnect_delay_secs <= 60 {
+                if (0..=60).contains(&failed_host_reconnect_delay_secs) {
                     self.failed_host_reconnect_delay_secs(Duration::from_secs(
                         failed_host_reconnect_delay_secs as u64,
                     ));
