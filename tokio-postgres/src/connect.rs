@@ -280,8 +280,8 @@ fn get_least_loaded_server(config: &Config) -> Result<Host, Error> {
     let placement_info_map_rr = PLACEMENT_INFO_MAP_RR.lock().unwrap().clone();
     let mut least_host: Vec<Host> = Vec::new();
 
-    let mut host_list: Vec<Host> = Vec::new();
-    let mut placement_info_map: HashMap<String, Vec<Host>> = HashMap::new();
+    let mut host_list: Vec<Host>;
+    let mut placement_info_map: HashMap<String, Vec<Host>>;
 
     if config.load_balance == "only-rr" || config.load_balance == "prefer-rr" {
         host_list = host_list_rr.clone();
