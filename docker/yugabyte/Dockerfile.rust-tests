@@ -1,0 +1,40 @@
+# Rust test runner for yugabyte/rust-postgres against YugabyteDB.
+# Use latest stable Rust (bookworm = Debian 12).
+# Pinning to a specific minor version causes recurring MSRV failures as
+# transitive dependencies (e.g. time, serde_spanned) continuously raise
+# their minimum required Rust. Latest stable always satisfies current MSRVs.
+FROM rust:bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        socat \
+        postgresql-client \
+        pkg-config \
+        libssl-dev \
+        libpq-dev \
+        python3 \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install cargo-nextest (pre-built binary, architecture-aware).
+# nextest provides per-test timeouts which prevent hanging tests from
+# destabilising the YugabyteDB server during long test runs.
+RUN ARCH="$(uname -m)" && \
+    case "$ARCH" in \
+        x86_64)          NEXTEST_ARCH="x86_64-unknown-linux-gnu" ;; \
+        aarch64|arm64)   NEXTEST_ARCH="aarch64-unknown-linux-gnu" ;; \
+        *) echo "Unsupported arch: $ARCH" && exit 1 ;; \
+    esac && \
+    NEXTEST_VERSION=$(curl -sSf https://api.github.com/repos/nextest-rs/nextest/releases/latest \
+        | grep '"tag_name"' | sed 's/.*"cargo-nextest-\([^"]*\)".*/\1/') && \
+    curl -LsSf \
+        "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${NEXTEST_ARCH}.tar.gz" \
+        | tar zxf - -C /usr/local/cargo/bin cargo-nextest
+
+COPY docker/run-tests.sh /usr/local/bin/run-tests.sh
+RUN chmod +x /usr/local/bin/run-tests.sh
+
+WORKDIR /src
+
+ENTRYPOINT ["/usr/local/bin/run-tests.sh"]

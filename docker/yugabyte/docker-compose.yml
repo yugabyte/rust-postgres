@@ -1,0 +1,63 @@
+# Two-container setup: YugabyteDB (YSQL) + Rust test runner.
+#
+# The test container waits for YSQL to be healthy, then creates the required
+# roles and extensions, and runs `cargo test`.
+#
+# Published *host* ports default to high numbers to avoid clashing with local
+# Postgres (5433) or other YugabyteDB stacks. Containers still use 5433 internally.
+# Override via docker/.env or env vars:
+#   YB_PUBLISH_YSQL=55433   YB_PUBLISH_9000=59000   YB_PUBLISH_UI=55434   YB_PUBLISH_YCQL=59042
+#
+# Runtime behaviour:
+#   YB_ENABLE_YSQL_CONN_MGR   1 → enable YSQL connection manager (default: 0 / off)
+
+services:
+  yugabyte:
+    image: yugabytedb/yugabyte:2025.2.2.1-b1
+    # Official YB image is typically amd64; pin platform to avoid ambiguous emulation on arm64.
+    platform: "${YB_PLATFORM:-linux/amd64}"
+    hostname: yugabyte
+    command: ["/bin/bash", "/scripts/yugabyted-entrypoint.sh"]
+    environment:
+      - YB_ENABLE_YSQL_CONN_MGR
+    ports:
+      - "${YB_PUBLISH_YSQL:-55433}:5433"
+      - "${YB_PUBLISH_9000:-59000}:9000"
+      - "${YB_PUBLISH_UI:-55434}:15433"
+      - "${YB_PUBLISH_YCQL:-59042}:9042"
+    shm_size: "1gb"
+    volumes:
+      - ./yugabyted-entrypoint.sh:/scripts/yugabyted-entrypoint.sh:ro
+      # ssl/ volume is retained for future SSL enablement but not actively used
+      # (YugabyteDB SSL requires a separate setup path, not ysql_pg_conf_csv=ssl=on)
+      - ./ssl:/opt/yugabyte/certs:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/home/yugabyte/bin/ysqlsh -h yugabyte -p 5433 -U yugabyte -c 'SELECT 1' -q || exit 1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 90
+      # Under amd64 emulation on arm64 hosts, startup is slower.
+      start_period: 300s
+
+  rust-tests:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rust-tests
+    depends_on:
+      yugabyte:
+        condition: service_healthy
+    environment:
+      YUGABYTE_HOST: yugabyte
+      YUGABYTE_PORT: "5433"
+      # Ensure cargo uses the pre-fetched deps from the build layer.
+      CARGO_HOME: /usr/local/cargo
+    volumes:
+      # Mount the cloned rust-postgres repo into /src.
+      # The repo must be cloned next to the Rust/ workspace, e.g.:
+      #   /Users/shashankkote/yugabyte/local_runs/Rust/rust-postgres/
+      - ../rust-postgres:/src
+    working_dir: /src
