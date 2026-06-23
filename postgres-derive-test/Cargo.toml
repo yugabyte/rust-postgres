@@ -8,9 +8,4 @@ edition = "2018"
 trybuild = "1.0"
 
 postgres-types = { path = "../postgres-types", features = ["derive"] }
-# Use the workspace-local yb-postgres (renamed to `postgres` here so the test
-# bodies' `use postgres::...` keep working) instead of the crates.io `postgres`
-# crate. The crates.io crate drags in its own postgres-types 0.2.x, which would
-# collide with the local postgres-types the #[derive(ToSql/FromSql)] macros emit
-# against — producing E0277 "multiple different versions of crate postgres_types".
 postgres = { package = "yb-postgres", path = "../postgres" }
