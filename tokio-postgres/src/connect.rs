@@ -3,7 +3,7 @@ use crate::config::{Host, LoadBalanceHosts, TargetSessionAttrs};
 use crate::connect_raw::connect_raw;
 use crate::connect_socket::connect_socket;
 use crate::tls::MakeTlsConnect;
-use crate::{Client, Config, Connection, Error, NoTls, SimpleQueryMessage, Socket};
+use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt, Stream};
 use lazy_static::lazy_static;
 use log::{debug, info};
@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::task::Poll;
 use std::time::Instant;
 use std::{cmp, io};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -71,6 +72,20 @@ static USE_PUBLIC_IP: AtomicBool = AtomicBool::new(false);
 
 pub async fn connect<T>(
     mut tls: T,
+    config: &Config,
+) -> Result<(Client, Connection<Socket, T::Stream>), Error>
+where
+    T: MakeTlsConnect<Socket>,
+{
+    connect_with_tls_ref(&mut tls, config).await
+}
+
+/// Same as [`connect`], but borrows the `MakeTlsConnect` instead of taking it by
+/// value. This lets callers that only hold a `&mut T` (such as the control
+/// connection in `check_and_refresh`) reuse the exact host-iteration logic
+/// while still using the caller-provided TLS connector.
+async fn connect_with_tls_ref<T>(
+    tls: &mut T,
     config: &Config,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
@@ -133,7 +148,7 @@ where
             None => host.cloned().unwrap(),
         };
 
-        match connect_host(addr, hostname, port, &mut tls, config).await {
+        match connect_host(addr, hostname, port, &mut *tls, config).await {
             Ok((client, connection)) => return Ok((client, connection)),
             Err(e) => error = Some(e),
         }
@@ -174,11 +189,12 @@ where
         return Err(Error::config("invalid number of ports".into()));
     }
 
-    if !check_and_refresh(config).await {
-        return Err(Error::connect(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "could not create control connection",
-        )));
+    if let Err(e) = check_and_refresh(&mut tls, config).await {
+        info!(
+            "Failed to establish control connection to available servers: {}",
+            error_chain(&e)
+        );
+        return Err(e);
     }
 
     let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
@@ -389,35 +405,45 @@ fn get_least_loaded_hosts(hosts: Vec<Host>, conn_map: HashMap<Host, i64>, failed
     least_host
 }
 
-async fn check_and_refresh(config: &Config) -> bool {
+/// Walks an [`Error`]'s `source` chain and renders it as a single
+/// `outer: inner: innermost` string, so control-connection failures surface the
+/// real underlying cause (DNS, TCP refused, TLS rejected, auth failed, ...)
+/// instead of a generic wrapper.
+fn error_chain(err: &Error) -> String {
+    use std::error::Error as StdError;
+
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(&format!(": {}", cause));
+        source = cause.source();
+    }
+    message
+}
+
+async fn check_and_refresh<T>(tls: &mut T, config: &Config) -> Result<(), Error>
+where
+    T: MakeTlsConnect<Socket>,
+{
     let mut refresh_time = LAST_TIME_META_DATA_FETCHED.lock().await;
     let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
     let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
     let host_list = [host_list_primary, host_list_rr].concat();
     if host_list.is_empty() {
         info!("Connecting to the server for the first time");
-        if let Ok((client, connection)) = connect(NoTls, config).await {
-            let handle = tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    eprintln!("connection error: {}", e);
-                }
-            });
-            info!("Control connection created to one of {:?}", config.host);
-            refresh(client, config).await;
-            let start = Instant::now();
-            *refresh_time = start;
-            info!("Resetting LAST_TIME_META_DATA_FETCHED");
-            handle.abort();
-            return true;
-        } else {
-            info!("Failed to establish control connection to available servers");
-            return false;
-        }
+        let (client, connection) = connect_with_tls_ref(tls, config).await?;
+        info!("Control connection created to one of {:?}", config.host);
+        refresh(client, connection, config).await?;
+        let start = Instant::now();
+        *refresh_time = start;
+        info!("Resetting LAST_TIME_META_DATA_FETCHED");
+        Ok(())
     } else {
         let duration = refresh_time.elapsed();
         if duration > config.yb_servers_refresh_interval {
             let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
             let mut index = 0;
+            let mut last_err: Option<Error> = None;
             while index < host_list.len() {
                 let host = host_list.get(index);
                 let mut conn_host = host.unwrap().to_owned();
@@ -443,38 +469,50 @@ async fn check_and_refresh(config: &Config) -> bool {
                     Host::Unix(_) => None,
                 };
 
-                if let Ok((client, connection)) = connect_host(
+                match connect_host(
                     conn_host.clone(),
                     hostname.clone(),
                     host_to_port_map[&(conn_host.clone())],
-                    &mut NoTls,
+                    &mut *tls,
                     config,
                 )
                 .await
                 {
-                    let handle = tokio::spawn(async move {
-                        if let Err(e) = connection.await {
-                            eprintln!("connection error: {}", e);
+                    Ok((client, connection)) => {
+                        info!("Control connection created to {:?}", hostname.clone());
+                        match refresh(client, connection, config).await {
+                            Ok(()) => {
+                                let start = Instant::now();
+                                *refresh_time = start;
+                                info!("Resetting LAST_TIME_META_DATA_FETCHED");
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                info!("Control connection to {:?} established but metadata refresh failed: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
+                                last_err = Some(e);
+                                add_to_failed_host_list(host.cloned().unwrap());
+                                index += 1;
+                            }
                         }
-                    });
-                    info!("Control connection created to {:?}", hostname.clone());
-                    refresh(client, config).await;
-                    let start = Instant::now();
-                    *refresh_time = start;
-                    info!("Resetting LAST_TIME_META_DATA_FETCHED");
-                    handle.abort();
-                    return true;
-                } else {
-                    info!("Failed to establish control connection to {:?}, adding this to failed host list and trying another server", hostname.clone());
-                    add_to_failed_host_list(host.cloned().unwrap());
-                    index += 1;
+                    }
+                    Err(e) => {
+                        info!("Failed to establish control connection to {:?}: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
+                        last_err = Some(e);
+                        add_to_failed_host_list(host.cloned().unwrap());
+                        index += 1;
+                    }
                 }
             }
             info!("Failed to establish control connection to available servers");
-            return false;
+            return Err(last_err.unwrap_or_else(|| {
+                Error::connect(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "could not create control connection",
+                ))
+            }));
         }
+        Ok(())
     }
-    true
 }
 
 fn add_to_failed_host_list(host: Host) {
@@ -483,7 +521,14 @@ fn add_to_failed_host_list(host: Host) {
     info!("Added {:?} to failed host list", host.clone());
 }
 
-async fn refresh(client: Client, config: &Config) {
+async fn refresh<S>(
+    client: Client,
+    mut connection: Connection<Socket, S>,
+    config: &Config,
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let socket_config = client.get_socket_config();
     let mut control_conn_host: String = String::new();
     if socket_config.is_some() {
@@ -491,10 +536,19 @@ async fn refresh(client: Client, config: &Config) {
     }
 
     info!("Executing query: `select * from yb_servers()` to fetch list of servers");
-    let rows = client
-        .query("select * from yb_servers()", &[])
-        .await
-        .unwrap();
+    // Drive the control connection inline while the metadata query runs rather
+    // than spawning it onto the runtime. This avoids requiring
+    // `T::Stream: Send + 'static` on the public connect API and lets query
+    // errors propagate to the caller instead of panicking via `unwrap()`.
+    let query = client.query("select * from yb_servers()", &[]);
+    pin_mut!(query);
+    let rows = future::poll_fn(|cx| {
+        if connection.poll_unpin(cx)?.is_ready() {
+            return Poll::Ready(Err(Error::closed()));
+        }
+        query.as_mut().poll(cx)
+    })
+    .await?;
 
     let mut host_list_primary = HOST_INFO_PRIMAY.lock().unwrap();
     let mut host_list_rr = HOST_INFO_RR.lock().unwrap();
@@ -634,6 +688,8 @@ async fn refresh(client: Client, config: &Config) {
             }
         }
     }
+
+    Ok(())
 }
 
 fn make_connection_count_zero(host: Host) {
