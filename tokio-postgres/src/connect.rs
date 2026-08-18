@@ -6,7 +6,7 @@ use crate::tls::MakeTlsConnect;
 use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt, Stream};
 use lazy_static::lazy_static;
-use log::{debug, info};
+use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashMap;
@@ -503,13 +503,44 @@ where
                     }
                 }
             }
-            info!("Failed to establish control connection to available servers");
-            return Err(last_err.unwrap_or_else(|| {
-                Error::connect(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "could not create control connection",
-                ))
-            }));
+            // Every discovered host failed, so the cached topology may simply be
+            // obsolete — the servers it names can have been replaced by ones at
+            // different addresses (a Kubernetes StatefulSet rollout that renames
+            // the pods, a cluster whose nodes were renumbered). Refreshing the
+            // cache needs a control connection, and a control connection has so
+            // far only been attempted against the cache being refreshed, so that
+            // state is self-sustaining: every connect fails for the life of the
+            // process even though the hosts the caller configured resolve fine.
+            //
+            // Fall back to those configured hosts, which are the only addresses
+            // the caller actually guaranteed, and let refresh() replace the stale
+            // entries so load balancing resumes on its own.
+            warn!(
+                "Failed to establish control connection to any discovered server; \
+                 falling back to the configured host(s) {:?}",
+                config.host
+            );
+            match connect_with_tls_ref(tls, config).await {
+                Ok((client, connection)) => {
+                    info!(
+                        "Control connection created to one of the configured host(s) {:?}",
+                        config.host
+                    );
+                    refresh(client, connection, config).await?;
+                    *refresh_time = Instant::now();
+                    info!("Resetting LAST_TIME_META_DATA_FETCHED");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to establish control connection to the configured host(s) too: {}",
+                        error_chain(&e)
+                    );
+                    // Report the discovered-host failure when there is one: it is
+                    // the more specific diagnosis of what went wrong.
+                    return Err(last_err.unwrap_or(e));
+                }
+            }
         }
         Ok(())
     }
