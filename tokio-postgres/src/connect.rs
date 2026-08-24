@@ -163,7 +163,7 @@ where
 }
 
 pub async fn yb_connect<T>(
-    tls: &mut T,
+    mut tls: T,
     config: &Config,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
@@ -194,12 +194,14 @@ where
         return Err(Error::config("invalid number of ports".into()));
     }
 
-    if let Err(e) = check_and_refresh(tls, config).await {
-        info!(
-            "Failed to establish control connection to available servers: {}",
-            error_chain(&e)
+    if let Err(e) = check_and_refresh(&mut tls, config).await {
+        warn!(
+            "Failed to establish control connection to available servers: {}. Falling back \
+             to upstream driver connection to the configured host(s) {:?}",
+            error_chain(&e),
+            config.host
         );
-        return Err(e);
+        return connect_with_tls_ref(&mut tls, config).await;
     }
 
     let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
@@ -209,8 +211,22 @@ where
         let mut host = match newhost {
             Ok(host) => host,
             Err(e) => {
-                // Throw the error
-                return Err(e);
+                // Only fallback to an upstream driver connection when the caller put
+                // no restriction on which node it will accept (`only-rr`,
+                // `only-primary` and `fallback_to_topology_keys_only`).
+                if config.load_balance == "only-rr"
+                    || config.load_balance == "only-primary"
+                    || (!config.topology_keys.is_empty() && config.fallback_to_topology_keys_only)
+                {
+                    return Err(e);
+                }
+                warn!(
+                    "No server available from the discovered topology: {}. Falling back to \
+                     an upstream driver connection to the configured host(s) {:?}",
+                    error_chain(&e),
+                    config.host
+                );
+                return connect_with_tls_ref(&mut tls, config).await;
             }
         };
 
@@ -242,7 +258,7 @@ where
             host.clone(),
             hostname.clone(),
             host_to_port_map[&(host.clone())],
-            &mut *tls,
+            &mut tls,
             config,
         )
         .await
@@ -414,7 +430,7 @@ fn get_least_loaded_hosts(hosts: Vec<Host>, conn_map: HashMap<Host, i64>, failed
 /// `outer: inner: innermost` string, so control-connection failures surface the
 /// real underlying cause (DNS, TCP refused, TLS rejected, auth failed, ...)
 /// instead of a generic wrapper.
-pub(crate) fn error_chain(err: &Error) -> String {
+fn error_chain(err: &Error) -> String {
     use std::error::Error as StdError;
 
     let mut message = err.to_string();

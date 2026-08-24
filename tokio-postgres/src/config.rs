@@ -2,12 +2,10 @@
 
 #[cfg(feature = "runtime")]
 use crate::connect::connect;
-use crate::connect::error_chain;
 use crate::connect::yb_connect;
 use crate::connect_raw::connect_raw;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::keepalive::KeepaliveConfig;
-use log::warn;
 #[cfg(feature = "runtime")]
 use crate::tls::MakeTlsConnect;
 use crate::tls::TlsConnect;
@@ -893,21 +891,7 @@ impl Config {
         T: MakeTlsConnect<Socket>,
     {
         if self.load_balance != "false" {
-            let mut tls = tls;
-            let load_balanced = yb_connect(&mut tls, self).await;
-            match load_balanced {
-                Ok(conn) => Ok(conn),
-                Err(e) => {
-                    // Fall back to the upstream connect path.
-                    warn!(
-                        "Load-balanced connect failed: {}. Falling back to a direct \
-                         connection to the configured host(s) {:?}",
-                        error_chain(&e),
-                        self.host
-                    );
-                    connect(tls, self).await
-                }
-            }
+            yb_connect(tls, self).await
         } else {
             connect(tls, self).await
         }
