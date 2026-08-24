@@ -6,18 +6,23 @@ use crate::tls::MakeTlsConnect;
 use crate::{Client, Config, Connection, Error, SimpleQueryMessage, Socket};
 use futures_util::{future, pin_mut, Future, FutureExt, Stream};
 use lazy_static::lazy_static;
-use log::{debug, info};
+use log::{debug, info, warn};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::task::Poll;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{cmp, io};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::time;
+
+/// Upper bound on a single control-connection attempt, covering both the socket
+/// connect and the `yb_servers()` query itself.
+const CONTROL_CONN_TIMEOUT: Duration = Duration::from_secs(15);
 
 lazy_static! {
     static ref CONNECTION_COUNT_MAP: Mutex<HashMap<Host, i64>> = {
@@ -158,7 +163,7 @@ where
 }
 
 pub async fn yb_connect<T>(
-    mut tls: T,
+    tls: &mut T,
     config: &Config,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
@@ -189,7 +194,7 @@ where
         return Err(Error::config("invalid number of ports".into()));
     }
 
-    if let Err(e) = check_and_refresh(&mut tls, config).await {
+    if let Err(e) = check_and_refresh(tls, config).await {
         info!(
             "Failed to establish control connection to available servers: {}",
             error_chain(&e)
@@ -237,7 +242,7 @@ where
             host.clone(),
             hostname.clone(),
             host_to_port_map[&(host.clone())],
-            &mut tls,
+            &mut *tls,
             config,
         )
         .await
@@ -409,7 +414,7 @@ fn get_least_loaded_hosts(hosts: Vec<Host>, conn_map: HashMap<Host, i64>, failed
 /// `outer: inner: innermost` string, so control-connection failures surface the
 /// real underlying cause (DNS, TCP refused, TLS rejected, auth failed, ...)
 /// instead of a generic wrapper.
-fn error_chain(err: &Error) -> String {
+pub(crate) fn error_chain(err: &Error) -> String {
     use std::error::Error as StdError;
 
     let mut message = err.to_string();
@@ -421,6 +426,20 @@ fn error_chain(err: &Error) -> String {
     message
 }
 
+/// Builds the `Config` used for control connections with connect_timeout bounded to
+/// `CONTROL_CONN_TIMEOUT`.
+fn control_connection_config(config: &Config) -> Config {
+    let mut control_config = config.clone();
+    control_config.connect_timeout = Some(
+        config
+            .connect_timeout
+            .map_or(CONTROL_CONN_TIMEOUT, |timeout| {
+                cmp::min(timeout, CONTROL_CONN_TIMEOUT)
+            }),
+    );
+    control_config
+}
+
 async fn check_and_refresh<T>(tls: &mut T, config: &Config) -> Result<(), Error>
 where
     T: MakeTlsConnect<Socket>,
@@ -429,90 +448,150 @@ where
     let host_list_primary = HOST_INFO_PRIMAY.lock().unwrap().clone();
     let host_list_rr = HOST_INFO_RR.lock().unwrap().clone();
     let host_list = [host_list_primary, host_list_rr].concat();
-    if host_list.is_empty() {
-        info!("Connecting to the server for the first time");
-        let (client, connection) = connect_with_tls_ref(tls, config).await?;
-        info!("Control connection created to one of {:?}", config.host);
-        refresh(client, connection, config).await?;
-        let start = Instant::now();
-        *refresh_time = start;
-        info!("Resetting LAST_TIME_META_DATA_FETCHED");
-        Ok(())
-    } else {
-        let duration = refresh_time.elapsed();
-        if duration > config.yb_servers_refresh_interval {
-            let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
-            let mut index = 0;
-            let mut last_err: Option<Error> = None;
-            while index < host_list.len() {
-                let host = host_list.get(index);
-                let mut conn_host = host.unwrap().to_owned();
-                //check if we are to use public hosts
-                if USE_PUBLIC_IP.load(Ordering::SeqCst) {
-                    let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
-                    let public_host = public_host_map.get(&conn_host.clone());
-                    if public_host.is_none() {
-                        info!("Public host not available for private host {:?}, adding this to failed host list and trying another server", conn_host.clone());
-                        add_to_failed_host_list(host.cloned().unwrap());
-                        index += 1;
-                        continue;
-                    } else {
-                        conn_host = public_host.unwrap().clone();
-                    }
+
+    let elapsed = refresh_time.elapsed();
+    if !host_list.is_empty() && elapsed <= config.yb_servers_refresh_interval {
+        debug!(
+            "Skipping `yb_servers()` refresh: last successful refresh was {:?} ago, \
+             within yb_servers_refresh_interval of {:?}",
+            elapsed, config.yb_servers_refresh_interval
+        );
+        return Ok(());
+    }
+
+    let control_config = control_connection_config(config);
+    let config_err = match connect_with_tls_ref(tls, &control_config).await {
+        Ok((client, connection)) => {
+            info!(
+                "Control connection created to one of the configured host(s) {:?}",
+                config.host
+            );
+            match refresh(client, connection, config).await {
+                Ok(()) => {
+                    *refresh_time = Instant::now();
+                    info!("Resetting LAST_TIME_META_DATA_FETCHED");
+                    return Ok(());
                 }
+                Err(e) => {
+                    // Fall through to the discovered hosts instead of giving up.
+                    info!(
+                        "Control connection to the configured host(s) established but metadata \
+                         refresh failed: {}, trying the discovered servers",
+                        error_chain(&e)
+                    );
+                    e
+                }
+            }
+        }
+        Err(e) => {
+            info!(
+                "Failed to establish control connection to the configured host(s) {:?}: {}, \
+                 trying the discovered servers",
+                config.host,
+                error_chain(&e)
+            );
+            e
+        }
+    };
 
-                // The value of host is used as the hostname for TLS validation,
-                let hostname = match conn_host.clone() {
-                    Host::Tcp(host) => Some(host),
-                    // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
-                    #[cfg(unix)]
-                    Host::Unix(_) => None,
-                };
+    // Fall back to the servers discovered by an earlier refresh, skipping any host
+    // already known to be down.
+    let failed_host_list = FAILED_HOSTS.lock().unwrap().clone();
+    let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
+    let host_list: Vec<Host> = host_list
+        .into_iter()
+        .filter(|host| !failed_host_list.contains_key(host))
+        .collect();
+    let discovered_candidates = host_list.len();
 
-                match connect_host(
-                    conn_host.clone(),
-                    hostname.clone(),
-                    host_to_port_map[&(conn_host.clone())],
-                    &mut *tls,
-                    config,
-                )
-                .await
-                {
-                    Ok((client, connection)) => {
-                        info!("Control connection created to {:?}", hostname.clone());
-                        match refresh(client, connection, config).await {
-                            Ok(()) => {
-                                let start = Instant::now();
-                                *refresh_time = start;
-                                info!("Resetting LAST_TIME_META_DATA_FETCHED");
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                info!("Control connection to {:?} established but metadata refresh failed: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
-                                last_err = Some(e);
-                                add_to_failed_host_list(host.cloned().unwrap());
-                                index += 1;
-                            }
-                        }
+    let mut discovered_err: Option<Error> = None;
+    let mut index = 0;
+    while index < host_list.len() {
+        let host = host_list.get(index);
+        let mut conn_host = host.unwrap().to_owned();
+        //check if we are to use public hosts
+        if USE_PUBLIC_IP.load(Ordering::SeqCst) {
+            let public_host_map = PUBLIC_HOST_MAP.lock().unwrap().clone();
+            let public_host = public_host_map.get(&conn_host.clone());
+            if public_host.is_none() {
+                info!("Public host not available for private host {:?}, adding this to failed host list and trying another server", conn_host.clone());
+                add_to_failed_host_list(host.cloned().unwrap());
+                index += 1;
+                continue;
+            } else {
+                conn_host = public_host.unwrap().clone();
+            }
+        }
+
+        // The value of host is used as the hostname for TLS validation,
+        let hostname = match conn_host.clone() {
+            Host::Tcp(host) => Some(host),
+            // postgres doesn't support TLS over unix sockets, so the choice here doesn't matter
+            #[cfg(unix)]
+            Host::Unix(_) => None,
+        };
+
+        match connect_host(
+            conn_host.clone(),
+            hostname.clone(),
+            host_to_port_map[&(conn_host.clone())],
+            &mut *tls,
+            &control_config,
+        )
+        .await
+        {
+            Ok((client, connection)) => {
+                info!("Control connection created to {:?}", hostname.clone());
+                match refresh(client, connection, config).await {
+                    Ok(()) => {
+                        *refresh_time = Instant::now();
+                        info!("Resetting LAST_TIME_META_DATA_FETCHED");
+                        return Ok(());
                     }
                     Err(e) => {
-                        info!("Failed to establish control connection to {:?}: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
-                        last_err = Some(e);
+                        info!("Control connection to {:?} established but metadata refresh failed: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
+                        discovered_err = Some(e);
                         add_to_failed_host_list(host.cloned().unwrap());
                         index += 1;
                     }
                 }
             }
-            info!("Failed to establish control connection to available servers");
-            return Err(last_err.unwrap_or_else(|| {
-                Error::connect(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "could not create control connection",
-                ))
-            }));
+            Err(e) => {
+                info!("Failed to establish control connection to {:?}: {}, adding this to failed host list and trying another server", hostname.clone(), error_chain(&e));
+                discovered_err = Some(e);
+                add_to_failed_host_list(host.cloned().unwrap());
+                index += 1;
+            }
         }
-        Ok(())
     }
+
+    if discovered_candidates == 0 {
+        warn!(
+            "Failed to establish control connection to the configured host(s) {:?}; no \
+             discovered server was available to fall back to",
+            config.host
+        );
+    } else {
+        warn!(
+            "Failed to establish control connection to the configured host(s) {:?} or to any \
+             of the {} discovered server(s)",
+            config.host, discovered_candidates
+        );
+    }
+
+    Err(match discovered_err {
+        Some(discovered) => Error::connect(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "could not create control connection: configured host(s) {:?}: {}; \
+                 last discovered server: {}",
+                config.host,
+                error_chain(&config_err),
+                error_chain(&discovered)
+            ),
+        )),
+        None => config_err,
+    })
 }
 
 fn add_to_failed_host_list(host: Host) {
@@ -542,13 +621,25 @@ where
     // errors propagate to the caller instead of panicking via `unwrap()`.
     let query = client.query("select * from yb_servers()", &[]);
     pin_mut!(query);
-    let rows = future::poll_fn(|cx| {
-        if connection.poll_unpin(cx)?.is_ready() {
-            return Poll::Ready(Err(Error::closed()));
-        }
-        query.as_mut().poll(cx)
-    })
-    .await?;
+    let rows = time::timeout(
+        CONTROL_CONN_TIMEOUT,
+        future::poll_fn(|cx| {
+            if connection.poll_unpin(cx)?.is_ready() {
+                return Poll::Ready(Err(Error::closed()));
+            }
+            query.as_mut().poll(cx)
+        }),
+    )
+    .await
+    .map_err(|_| {
+        Error::connect(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "`select * from yb_servers()` did not complete within {:?}",
+                CONTROL_CONN_TIMEOUT
+            ),
+        ))
+    })??;
 
     let mut host_list_primary = HOST_INFO_PRIMAY.lock().unwrap();
     let mut host_list_rr = HOST_INFO_RR.lock().unwrap();
