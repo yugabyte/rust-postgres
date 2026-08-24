@@ -635,27 +635,44 @@ where
     // than spawning it onto the runtime. This avoids requiring
     // `T::Stream: Send + 'static` on the public connect API and lets query
     // errors propagate to the caller instead of panicking via `unwrap()`.
-    let query = client.query("select * from yb_servers()", &[]);
-    pin_mut!(query);
-    let rows = time::timeout(
-        CONTROL_CONN_TIMEOUT,
-        future::poll_fn(|cx| {
-            if connection.poll_unpin(cx)?.is_ready() {
-                return Poll::Ready(Err(Error::closed()));
-            }
-            query.as_mut().poll(cx)
-        }),
-    )
-    .await
-    .map_err(|_| {
-        Error::connect(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "`select * from yb_servers()` did not complete within {:?}",
-                CONTROL_CONN_TIMEOUT
-            ),
-        ))
-    })??;
+    let rows = {
+        let query = client.query("select * from yb_servers()", &[]);
+        pin_mut!(query);
+        time::timeout(
+            CONTROL_CONN_TIMEOUT,
+            future::poll_fn(|cx| {
+                if connection.poll_unpin(cx)?.is_ready() {
+                    return Poll::Ready(Err(Error::closed()));
+                }
+                query.as_mut().poll(cx)
+            }),
+        )
+        .await
+        .map_err(|_| {
+            Error::connect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "`select * from yb_servers()` did not complete within {:?}",
+                    CONTROL_CONN_TIMEOUT
+                ),
+            ))
+        })??
+    };
+
+    // Close the control connection.
+    drop(client);
+    match time::timeout(CONTROL_CONN_TIMEOUT, connection).await {
+        Ok(Ok(())) => debug!("Control connection to {:?} closed cleanly", control_conn_host),
+        Ok(Err(e)) => debug!(
+            "Control connection to {:?} reported {} while closing",
+            control_conn_host,
+            error_chain(&e)
+        ),
+        Err(_) => debug!(
+            "Control connection to {:?} did not shut down within {:?}, dropping it",
+            control_conn_host, CONTROL_CONN_TIMEOUT
+        ),
+    }
 
     let mut host_list_primary = HOST_INFO_PRIMAY.lock().unwrap();
     let mut host_list_rr = HOST_INFO_RR.lock().unwrap();
