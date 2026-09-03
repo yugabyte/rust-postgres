@@ -20,9 +20,24 @@ use tokio::net;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time;
 
-/// Upper bound on a single control-connection attempt, covering both the socket
-/// connect and the `yb_servers()` query itself.
-const CONTROL_CONN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bounds on a control connection.
+///
+/// * `CONNECT_TIMEOUT` -- the TCP connect. This is all `Config::connect_timeout`
+///   reaches: `connect_socket` wraps only `TcpStream::connect`, so the SSLRequest
+///   exchange, the TLS handshake and `startup`/`authenticate`/`read_info` are not
+///   covered by it.
+/// * `SOCKET_TIMEOUT` -- establishing the whole session: connect, TLS and
+///   authentication. Without this a server that completes the TCP handshake and
+///   then goes silent hangs the refresh indefinitely while holding
+///   LAST_TIME_META_DATA_FETCHED, which is the failure this exists to prevent.
+/// * `QUERY_TIMEOUT` -- the `yb_servers()` query once the session exists.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Closing a control connection is a courtesy, so it gets a short leash since
+/// the shutdown is awaited while LAST_TIME_META_DATA_FETCHED is still held.
+const CONTROL_CONN_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 lazy_static! {
     static ref CONNECTION_COUNT_MAP: Mutex<HashMap<Host, i64>> = {
@@ -443,17 +458,49 @@ fn error_chain(err: &Error) -> String {
 }
 
 /// Builds the `Config` used for control connections with connect_timeout bounded to
-/// `CONTROL_CONN_TIMEOUT`.
+/// `CONNECT_TIMEOUT`.
 fn control_connection_config(config: &Config) -> Config {
     let mut control_config = config.clone();
     control_config.connect_timeout = Some(
         config
             .connect_timeout
-            .map_or(CONTROL_CONN_TIMEOUT, |timeout| {
-                cmp::min(timeout, CONTROL_CONN_TIMEOUT)
+            .map_or(CONNECT_TIMEOUT, |timeout| {
+                cmp::min(timeout, CONNECT_TIMEOUT)
             }),
     );
     control_config
+}
+
+/// Collapses the `time::timeout` result around a control-connection establish into
+/// the plain `Result` the call sites already handle.
+///
+/// A real connect error passes through untouched so `error_chain` still reports the
+/// underlying cause; only an elapsed deadline is turned into an error of its own.
+fn establish_control_connection<T>(
+    target: &str,
+    outcome: Result<Result<T, Error>, time::error::Elapsed>,
+) -> Result<T, Error> {
+    match outcome {
+        Ok(inner) => inner,
+        Err(_) => {
+            // Distinct from a refused connect: the host answered at the TCP level and
+            // then stalled somewhere in TLS or authentication. Worth its own line,
+            // because it is the failure this bound exists to catch and it is otherwise
+            // indistinguishable from a slow network in the returned error.
+            warn!(
+                "Control connection to {} did not finish connecting, TLS and \
+                 authentication within {:?}, giving up on it",
+                target, SOCKET_TIMEOUT
+            );
+            Err(Error::connect(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "control connection to {} was not established within {:?}",
+                    target, SOCKET_TIMEOUT
+                ),
+            )))
+        }
+    }
 }
 
 async fn check_and_refresh<T>(tls: &mut T, config: &Config) -> Result<(), Error>
@@ -476,7 +523,12 @@ where
     }
 
     let control_config = control_connection_config(config);
-    let config_err = match connect_with_tls_ref(tls, &control_config).await {
+    // SOCKET_TIMEOUT wraps the entire establish -- connect, TLS and authentication --
+    // because the connect_timeout inside it reaches only the TCP connect.
+    let config_err = match establish_control_connection(
+        &format!("configured host(s) {:?}", config.host),
+        time::timeout(SOCKET_TIMEOUT, connect_with_tls_ref(tls, &control_config)).await,
+    ) {
         Ok((client, connection)) => {
             info!(
                 "Control connection created to one of the configured host(s) {:?}",
@@ -547,15 +599,20 @@ where
             Host::Unix(_) => None,
         };
 
-        match connect_host(
-            conn_host.clone(),
-            hostname.clone(),
-            host_to_port_map[&(conn_host.clone())],
-            &mut *tls,
-            &control_config,
-        )
-        .await
-        {
+        match establish_control_connection(
+            &format!("{:?}", conn_host),
+            time::timeout(
+                SOCKET_TIMEOUT,
+                connect_host(
+                    conn_host.clone(),
+                    hostname.clone(),
+                    host_to_port_map[&(conn_host.clone())],
+                    &mut *tls,
+                    &control_config,
+                ),
+            )
+            .await,
+        ) {
             Ok((client, connection)) => {
                 info!("Control connection created to {:?}", hostname.clone());
                 match refresh(client, connection, config).await {
@@ -639,7 +696,7 @@ where
         let query = client.query("select * from yb_servers()", &[]);
         pin_mut!(query);
         time::timeout(
-            CONTROL_CONN_TIMEOUT,
+            QUERY_TIMEOUT,
             future::poll_fn(|cx| {
                 if connection.poll_unpin(cx)?.is_ready() {
                     return Poll::Ready(Err(Error::closed()));
@@ -653,7 +710,7 @@ where
                 io::ErrorKind::TimedOut,
                 format!(
                     "`select * from yb_servers()` did not complete within {:?}",
-                    CONTROL_CONN_TIMEOUT
+                    QUERY_TIMEOUT
                 ),
             ))
         })??
@@ -661,7 +718,7 @@ where
 
     // Close the control connection.
     drop(client);
-    match time::timeout(CONTROL_CONN_TIMEOUT, connection).await {
+    match time::timeout(CONTROL_CONN_CLOSE_TIMEOUT, connection).await {
         Ok(Ok(())) => debug!("Control connection to {:?} closed cleanly", control_conn_host),
         Ok(Err(e)) => debug!(
             "Control connection to {:?} reported {} while closing",
@@ -670,7 +727,7 @@ where
         ),
         Err(_) => debug!(
             "Control connection to {:?} did not shut down within {:?}, dropping it",
-            control_conn_host, CONTROL_CONN_TIMEOUT
+            control_conn_host, CONTROL_CONN_CLOSE_TIMEOUT
         ),
     }
 
