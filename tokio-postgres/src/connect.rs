@@ -27,9 +27,7 @@ use tokio::time;
 ///   exchange, the TLS handshake and `startup`/`authenticate`/`read_info` are not
 ///   covered by it.
 /// * `SOCKET_TIMEOUT` -- establishing the whole session: connect, TLS and
-///   authentication. Without this a server that completes the TCP handshake and
-///   then goes silent hangs the refresh indefinitely while holding
-///   LAST_TIME_META_DATA_FETCHED, which is the failure this exists to prevent.
+///   authentication.
 /// * `QUERY_TIMEOUT` -- the `yb_servers()` query once the session exists.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
@@ -216,7 +214,9 @@ where
             error_chain(&e),
             config.host
         );
-        return connect_with_tls_ref(&mut tls, config).await;
+        let (client, connection) = connect_with_tls_ref(&mut tls, config).await?;
+        count_unbalanced_connection(&client);
+        return Ok((client, connection));
     }
 
     let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
@@ -241,7 +241,9 @@ where
                     error_chain(&e),
                     config.host
                 );
-                return connect_with_tls_ref(&mut tls, config).await;
+                let (client, connection) = connect_with_tls_ref(&mut tls, config).await?;
+                count_unbalanced_connection(&client);
+                return Ok((client, connection));
             }
         };
 
@@ -471,11 +473,28 @@ fn control_connection_config(config: &Config) -> Config {
     control_config
 }
 
-/// Collapses the `time::timeout` result around a control-connection establish into
-/// the plain `Result` the call sites already handle.
+/// Counts a connection that did not come from the load-balanced path.
 ///
-/// A real connect error passes through untouched so `error_chain` still reports the
-/// underlying cause; only an elapsed deadline is turned into an error of its own.
+/// `increase_connection_count` is otherwise only called for a host chosen by
+/// `get_least_loaded_server`, while the decrement side fires for every client that
+/// is closed or dropped (`lib.rs`, and `Client::drop` in the sync wrapper). Left
+/// asymmetric, a fallback connection to a host that is also a discovered host
+/// decrements a count it never contributed to, and `get_least_loaded_hosts` then
+/// reads the depressed value and treats that host as the least loaded one.
+fn count_unbalanced_connection(client: &Client) {
+    if let Some(socket_config) = client.get_socket_config() {
+        if let Some(hostname) = socket_config.hostname {
+            info!(
+                "Counting fallback upstream connection to {} against its connection count.",
+                hostname
+            );
+            increase_connection_count(Host::Tcp(hostname));
+        }
+    }
+}
+
+/// Collapses the `time::timeout` result around a control-connection establish into
+/// the plain `Result` the call sites already handle, naming the bound that fired.
 fn establish_control_connection<T>(
     target: &str,
     outcome: Result<Result<T, Error>, time::error::Elapsed>,
@@ -483,10 +502,6 @@ fn establish_control_connection<T>(
     match outcome {
         Ok(inner) => inner,
         Err(_) => {
-            // Distinct from a refused connect: the host answered at the TCP level and
-            // then stalled somewhere in TLS or authentication. Worth its own line,
-            // because it is the failure this bound exists to catch and it is otherwise
-            // indistinguishable from a slow network in the returned error.
             warn!(
                 "Control connection to {} did not finish connecting, TLS and \
                  authentication within {:?}, giving up on it",
@@ -575,10 +590,7 @@ where
         .collect();
     let discovered_candidates = host_list.len();
 
-    // The failed hosts are printed with time-since-marked-down rather than the raw
-    // Instant, which debug-prints as an opaque monotonic counter: what matters when
-    // reading this is how each entry compares with failed_host_reconnect_delay_secs.
-    info!(
+    debug!(
         "Discovered hosts to try for a control connection: {:?}; failed hosts \
          (host, time since marked down, delay {:?}): {:?}",
         host_list,
