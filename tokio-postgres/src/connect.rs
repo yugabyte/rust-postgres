@@ -562,15 +562,32 @@ where
         }
     };
 
-    // Fall back to the servers discovered by an earlier refresh, skipping any host
-    // already known to be down.
+    // Fall back to the servers discovered by an earlier refresh, skipping hosts known
+    // to be down -- but only while their reconnect delay has not elapsed.
     let failed_host_list = FAILED_HOSTS.lock().unwrap().clone();
     let host_to_port_map = HOST_TO_PORT_MAP.lock().unwrap().clone();
     let host_list: Vec<Host> = host_list
         .into_iter()
-        .filter(|host| !failed_host_list.contains_key(host))
+        .filter(|host| match failed_host_list.get(host) {
+            Some(failed_at) => failed_at.elapsed() > config.failed_host_reconnect_delay_secs,
+            None => true,
+        })
         .collect();
     let discovered_candidates = host_list.len();
+
+    // The failed hosts are printed with time-since-marked-down rather than the raw
+    // Instant, which debug-prints as an opaque monotonic counter: what matters when
+    // reading this is how each entry compares with failed_host_reconnect_delay_secs.
+    info!(
+        "Discovered hosts to try for a control connection: {:?}; failed hosts \
+         (host, time since marked down, delay {:?}): {:?}",
+        host_list,
+        config.failed_host_reconnect_delay_secs,
+        failed_host_list
+            .iter()
+            .map(|(host, marked_at)| (host, marked_at.elapsed()))
+            .collect::<Vec<_>>()
+    );
 
     let mut discovered_err: Option<Error> = None;
     let mut index = 0;
