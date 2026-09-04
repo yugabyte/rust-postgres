@@ -26,11 +26,11 @@ use tokio::time;
 ///   reaches: `connect_socket` wraps only `TcpStream::connect`, so the SSLRequest
 ///   exchange, the TLS handshake and `startup`/`authenticate`/`read_info` are not
 ///   covered by it.
-/// * `SOCKET_TIMEOUT` -- establishing the whole session: connect, TLS and
+/// * `LOGIN_TIMEOUT` -- establishing the whole session: connect, TLS and
 ///   authentication.
 /// * `QUERY_TIMEOUT` -- the `yb_servers()` query once the session exists.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Closing a control connection is a courtesy, so it gets a short leash since
@@ -95,16 +95,19 @@ pub async fn connect<T>(
 where
     T: MakeTlsConnect<Socket>,
 {
-    connect_with_tls_ref(&mut tls, config).await
+    connect_with_tls_ref(&mut tls, config, None).await
 }
 
 /// Same as [`connect`], but borrows the `MakeTlsConnect` instead of taking it by
 /// value. This lets callers that only hold a `&mut T` (such as the control
 /// connection in `check_and_refresh`) reuse the exact host-iteration logic
 /// while still using the caller-provided TLS connector.
+/// `attempt_timeout` bounds each candidate individually, not the loop as a whole,
+/// so that a couple of blackholed candidates do not starve the rest.
 async fn connect_with_tls_ref<T>(
     tls: &mut T,
     config: &Config,
+    attempt_timeout: Option<Duration>,
 ) -> Result<(Client, Connection<Socket, T::Stream>), Error>
 where
     T: MakeTlsConnect<Socket>,
@@ -166,7 +169,16 @@ where
             None => host.cloned().unwrap(),
         };
 
-        match connect_host(addr, hostname, port, &mut *tls, config).await {
+        let label = format!("{:?}", addr);
+        let attempt = connect_host(addr, hostname, port, &mut *tls, config);
+        let outcome = match attempt_timeout {
+            Some(limit) => {
+                establish_control_connection(&label, limit, time::timeout(limit, attempt).await)
+            }
+            None => attempt.await,
+        };
+
+        match outcome {
             Ok((client, connection)) => return Ok((client, connection)),
             Err(e) => error = Some(e),
         }
@@ -214,7 +226,7 @@ where
             error_chain(&e),
             config.host
         );
-        let (client, connection) = connect_with_tls_ref(&mut tls, config).await?;
+        let (client, connection) = connect_with_tls_ref(&mut tls, config, None).await?;
         count_unbalanced_connection(&client);
         return Ok((client, connection));
     }
@@ -241,7 +253,7 @@ where
                     error_chain(&e),
                     config.host
                 );
-                let (client, connection) = connect_with_tls_ref(&mut tls, config).await?;
+                let (client, connection) = connect_with_tls_ref(&mut tls, config, None).await?;
                 count_unbalanced_connection(&client);
                 return Ok((client, connection));
             }
@@ -497,6 +509,7 @@ fn count_unbalanced_connection(client: &Client) {
 /// the plain `Result` the call sites already handle, naming the bound that fired.
 fn establish_control_connection<T>(
     target: &str,
+    limit: Duration,
     outcome: Result<Result<T, Error>, time::error::Elapsed>,
 ) -> Result<T, Error> {
     match outcome {
@@ -505,13 +518,13 @@ fn establish_control_connection<T>(
             warn!(
                 "Control connection to {} did not finish connecting, TLS and \
                  authentication within {:?}, giving up on it",
-                target, SOCKET_TIMEOUT
+                target, limit
             );
             Err(Error::connect(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
                     "control connection to {} was not established within {:?}",
-                    target, SOCKET_TIMEOUT
+                    target, limit
                 ),
             )))
         }
@@ -538,12 +551,8 @@ where
     }
 
     let control_config = control_connection_config(config);
-    // SOCKET_TIMEOUT wraps the entire establish -- connect, TLS and authentication --
-    // because the connect_timeout inside it reaches only the TCP connect.
-    let config_err = match establish_control_connection(
-        &format!("configured host(s) {:?}", config.host),
-        time::timeout(SOCKET_TIMEOUT, connect_with_tls_ref(tls, &control_config)).await,
-    ) {
+    // LOGIN_TIMEOUT is handed down so that it bounds each configured host separately.
+    let config_err = match connect_with_tls_ref(tls, &control_config, Some(LOGIN_TIMEOUT)).await {
         Ok((client, connection)) => {
             info!(
                 "Control connection created to one of the configured host(s) {:?}",
@@ -630,8 +639,9 @@ where
 
         match establish_control_connection(
             &format!("{:?}", conn_host),
+            LOGIN_TIMEOUT,
             time::timeout(
-                SOCKET_TIMEOUT,
+                LOGIN_TIMEOUT,
                 connect_host(
                     conn_host.clone(),
                     hostname.clone(),
