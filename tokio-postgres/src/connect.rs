@@ -720,10 +720,11 @@ async fn refresh<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let socket_config = client.get_socket_config();
-    let mut control_conn_host: String = String::new();
-    if socket_config.is_some() {
-        control_conn_host = socket_config.unwrap().hostname.unwrap();
+    let mut control_conn_host = String::new();
+    if let Some(socket_config) = client.get_socket_config() {
+        if let Some(hostname) = socket_config.hostname {
+            control_conn_host = hostname;
+        }
     }
 
     info!("Executing query: `select * from yb_servers()` to fetch list of servers");
@@ -795,7 +796,9 @@ where
         host_to_port_map.insert(host.clone(), port);
         host_to_port_map.insert(public_ip.clone(), port);
 
-        if control_conn_host.eq_ignore_ascii_case(&public_ip_string) {
+        if !control_conn_host.is_empty()
+            && control_conn_host.eq_ignore_ascii_case(&public_ip_string)
+        {
             USE_PUBLIC_IP.store(true, Ordering::SeqCst);
         }
 
