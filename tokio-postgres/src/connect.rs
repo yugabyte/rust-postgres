@@ -679,13 +679,13 @@ where
 
     if discovered_candidates == 0 {
         warn!(
-            "Failed to establish control connection to the configured host(s) {:?}; no \
+            "Failed to refresh metadata using the configured host(s) {:?}; no \
              discovered server was available to fall back to",
             config.host
         );
     } else {
         warn!(
-            "Failed to establish control connection to the configured host(s) {:?} or to any \
+            "Failed to refresh metadata using the configured host(s) {:?} or any \
              of the {} discovered server(s)",
             config.host, discovered_candidates
         );
