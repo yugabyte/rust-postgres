@@ -222,7 +222,7 @@ where
     if let Err(e) = check_and_refresh(&mut tls, config).await {
         warn!(
             "Failed to establish control connection to available servers: {}. Falling back \
-             to upstream driver connection to the configured host(s) {:?}",
+             to the upstream driver behaviour and attempting a connection to the configured host(s) {:?}",
             error_chain(&e),
             config.host
         );
@@ -249,7 +249,7 @@ where
                 }
                 warn!(
                     "No server available from the discovered topology: {}. Falling back to \
-                     an upstream driver connection to the configured host(s) {:?}",
+                     the upstream driver behaviour and attempting a connection to the configured host(s) {:?}",
                     error_chain(&e),
                     config.host
                 );
