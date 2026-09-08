@@ -204,11 +204,14 @@ where
 
 ///close connection to server
 pub fn close(client: &Client) {
-    let socket_config = client.get_socket_config();
-    if socket_config.is_some() {
-        let host = socket_config.unwrap().hostname;
-        info!("closing one connection to {:?}", host);
-        decrease_connection_count(Host::Tcp(host.unwrap()));
+    if let Some(socket_config) = client.get_socket_config() {
+        if let Some(hostname) = socket_config.hostname {
+            info!(
+                "Closing one connection to {}",
+                hostname
+            );
+            decrease_connection_count(Host::Tcp(hostname));
+        }
     }
 }
 
